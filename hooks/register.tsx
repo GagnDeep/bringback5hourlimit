@@ -1,0 +1,376 @@
+// bringback5hourlimit: a local, self-imposed rolling usage cap.
+// Wiring only: every decision is made by the pure functions in ./logic.
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { BandView } from '../types'
+import * as L from './logic'
+
+type $T = EngineInterface
+
+const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null)
+
+const KEY_BLOCK = 'block'
+const KEY_LIMITS = 'limits'
+const KEY_CONTROL = 'control'
+const KEY_OVERRIDES = 'overrides'
+const KEY_TOK = 'tok:'
+const REFRESH_MS = 30_000
+const STALE_COUNTER_MS = 24 * 3_600_000
+const HOUR = 3_600_000
+
+/** Per-load module state: lost on reload, which only re-arms toasts and notes. */
+type Ctx = {
+  options: Record<string, unknown>
+  sessionId: string
+  lastCfg: L.Config
+  lastStatus: L.Status | undefined
+  mainTurnRunning: boolean
+  toasted: Set<string>
+  noted: Set<string>
+}
+
+type Snapshot = {
+  cfg: L.Config
+  invalid: string[]
+  now: number
+  block: L.Block
+  isIdle: boolean
+  control: L.Control
+  status: L.Status
+}
+
+// ------------------------------------------------------------ storage
+
+async function getJSON<T>($: $T, key: string): Promise<T | undefined> {
+  const v = await $.store.get(key)
+  return v === undefined || v === null ? undefined : (v as T)
+}
+
+async function envLayer($: $T): Promise<Record<string, unknown>> {
+  return {
+    windowHours: await $.env.get('BB5H_WINDOW_HOURS'),
+    mode: await $.env.get('BB5H_MODE'),
+    officialCapPct: await $.env.get('BB5H_OFFICIAL_CAP_PCT'),
+    weeklyBudgetPct: await $.env.get('BB5H_BLOCK_BUDGET_PCT_OF_WEEKLY'),
+    tokenBudget: await $.env.get('BB5H_TOKEN_BUDGET'),
+    warnPct: await $.env.get('BB5H_WARN_PCT'),
+    failMode: await $.env.get('BB5H_FAIL_MODE'),
+    showBar: await $.env.get('BB5H_SHOW_BAR'),
+    timeZone: await $.env.get('BB5H_TIMEZONE'),
+  }
+}
+
+async function loadConfig($: $T, ctx: Ctx) {
+  const overrides = (await getJSON<Record<string, unknown>>($, KEY_OVERRIDES)) ?? {}
+  const r = L.resolveConfig(ctx.options, await envLayer($), overrides)
+  ctx.lastCfg = r.config
+  return r
+}
+
+async function ensureSessionId($: $T, ctx: Ctx): Promise<string> {
+  if (!ctx.sessionId) {
+    const id = await $.session.id().catch(() => '')
+    ctx.sessionId = id || `anon-${Math.random().toString(36).slice(2)}`
+  }
+  return ctx.sessionId
+}
+
+/** Re-reads the shared block, merges ours in, writes when it changed. */
+async function writeBlock($: $T, mine: L.Block, now: number): Promise<L.Block> {
+  const stored = await getJSON<L.Block>($, KEY_BLOCK)
+  const merged = L.mergeBlock(stored, mine, now) ?? mine
+  if (JSON.stringify(merged) !== JSON.stringify(stored)) await $.store.set(KEY_BLOCK, merged)
+  return merged
+}
+
+async function readTokens($: $T, blockStart: number): Promise<number> {
+  const keys = (await $.store.keys()).filter(k => k.startsWith(KEY_TOK))
+  const counters: (L.TokenCounter | undefined)[] = []
+  for (const k of keys) counters.push(await getJSON<L.TokenCounter>($, k))
+  return L.sumTokens(counters, blockStart)
+}
+
+async function saveLimits($: $T, fresh: L.Limits | undefined): Promise<void> {
+  if (!fresh) return
+  const stored = await getJSON<L.Limits>($, KEY_LIMITS)
+  if (L.mergeLimits(stored, fresh) === fresh) await $.store.set(KEY_LIMITS, fresh)
+}
+
+async function readLimits($: $T, now: number): Promise<L.Limits | undefined> {
+  try {
+    const usage = await $.session.usage()
+    await saveLimits($, L.parseRateLimits(usage.rateLimits, now))
+  } catch {
+    // The usage source failed: strategy selection degrades on stale data.
+  }
+  return getJSON<L.Limits>($, KEY_LIMITS)
+}
+
+// ------------------------------------------------------------ core
+
+/** Measures everything; `start` begins a block when none is active. */
+async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
+  const now = await $.clock.now()
+  const { config: cfg, invalid } = await loadConfig($, ctx)
+  const limits = await readLimits($, now)
+  const control = (await getJSON<L.Control>($, KEY_CONTROL)) ?? {}
+  const stored = await getJSON<L.Block>($, KEY_BLOCK)
+  const isIdle = !L.isActive(stored, now) && !start
+  let block = L.ensureBlock(stored, now, cfg, limits)
+  if (!isIdle) {
+    const fresh = L.isFresh(limits, now, cfg) ? limits : undefined
+    if (fresh?.sevenDay && fresh.at >= block.startedAt - 60_000) block = L.observeWeekly(block, fresh.sevenDay.pct)
+    block = await writeBlock($, block, now)
+  }
+  const tokens = isIdle ? 0 : await readTokens($, block.startedAt)
+  const status = L.evaluate({ cfg, now, block, limits, tokens, control })
+  ctx.lastStatus = status
+  await publish($, cfg, status, now, isIdle)
+  return { cfg, invalid, now, block, isIdle, control, status }
+}
+
+async function publish($: $T, cfg: L.Config, status: L.Status, now: number, isIdle: boolean): Promise<void> {
+  const next: BandView = { text: L.bandText(status, now, cfg.timeZone, 160, isIdle), level: status.level, show: cfg.showBar }
+  await update($, view, prev =>
+    prev && prev.text === next.text && prev.level === next.level && prev.show === next.show ? prev : next,
+  )
+}
+
+/** Warnings and the wrap-up note, once per block. */
+async function react($: $T, ctx: Ctx, snap: Snapshot): Promise<void> {
+  const { status: s, block, now, cfg } = snap
+  if (snap.isIdle) return
+  const id = String(block.startedAt)
+  if (s.level === 'warn' && !ctx.toasted.has(`${id}:warn`)) {
+    ctx.toasted.add(`${id}:warn`)
+    $.ui.toast(`${s.windowLabel} budget at ${Math.floor(s.pct)}% · resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}`, { timeoutMs: 8000 })
+  }
+  if (s.level === 'cap' && !ctx.toasted.has(`${id}:cap`)) {
+    ctx.toasted.add(`${id}:cap`)
+    ctx.toasted.add(`${id}:warn`)
+    $.ui.toast(
+      `${s.windowLabel} budget spent · new prompts and agents paused until ${L.formatClock(s.resetsAt, cfg.timeZone, now)} · /5h unlock to override`,
+      { timeoutMs: 12000 },
+    )
+    await $.ui.notify(`${s.windowLabel} budget spent. Resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}.`, { title: 'bringback5hourlimit' }).catch(() => undefined)
+  }
+  if (s.level === 'failing' && !ctx.toasted.has(`${id}:failing`)) {
+    ctx.toasted.add(`${id}:failing`)
+    $.ui.toast(
+      cfg.failMode === 'open'
+        ? `⚠ Cap not enforcing: ${s.reason}. Failing open; /5h status`
+        : `⚠ Can't measure usage (${s.reason}); failing closed: new work is refused. /5h off to pause.`,
+      { timeoutMs: 10000 },
+    )
+  }
+  if (s.level === 'cap' && ctx.mainTurnRunning) await note($, ctx, s, now, cfg, block, undefined)
+}
+
+async function note($: $T, ctx: Ctx, s: L.Status, now: number, cfg: L.Config, block: L.Block, agentId: string | undefined): Promise<void> {
+  const key = `${block.startedAt}:${agentId ?? 'main'}`
+  if (ctx.noted.has(key)) return
+  ctx.noted.add(key)
+  const message = { type: 'user' as const, content: [{ type: 'text' as const, text: L.wrapUpNote(s, now, cfg.timeZone) }] }
+  await $.session.append(agentId ? { message, agentId } : { message }).catch(() => undefined)
+}
+
+function logError($: $T, err: unknown): void {
+  $.ui.log(`bringback5hourlimit: ${err instanceof Error ? err.message : String(err)}`)
+}
+
+// ------------------------------------------------------------ hook bodies
+
+async function onSessionStart($: $T, ctx: Ctx): Promise<void> {
+  await ensureSessionId($, ctx)
+  await $.command.register({
+    name: '5h',
+    description: 'Self-imposed usage cap: status | on | off | unlock | reset | set <key> <value> | bar on|off',
+    argumentHint: '[status|on|off|unlock|reset|set <key> <value>|bar on|off]',
+    immediate: true,
+  })
+  const now = await $.clock.now()
+  for (const k of (await $.store.keys()).filter(k => k.startsWith(KEY_TOK))) {
+    const c = await getJSON<L.TokenCounter>($, k)
+    if (!c || now - c.at > STALE_COUNTER_MS) await $.store.delete(k)
+  }
+  await snapshot($, ctx, false)
+}
+
+async function onTick($: $T, ctx: Ctx): Promise<void> {
+  try {
+    await react($, ctx, await snapshot($, ctx, false))
+  } catch (err) {
+    logError($, err)
+  }
+}
+
+async function onMeasure($: $T, ctx: Ctx, rateLimits: readonly L.RateLimitLike[], changed: readonly string[]): Promise<void> {
+  if (changed.includes('rateLimits')) await saveLimits($, L.parseRateLimits(rateLimits, await $.clock.now()))
+  await react($, ctx, await snapshot($, ctx, false))
+}
+
+async function onTurnComplete($: $T, ctx: Ctx, usage: L.UsageLike | undefined): Promise<void> {
+  const tokens = L.weightedTokens(usage)
+  if (tokens > 0) {
+    const sid = await ensureSessionId($, ctx)
+    const live = await snapshot($, ctx, true) // activity starts a block
+    const key = KEY_TOK + sid
+    const counter = await getJSON<L.TokenCounter>($, key)
+    await $.store.set(key, L.addTokens(counter, live.block.startedAt, tokens, live.now))
+  }
+  await react($, ctx, await snapshot($, ctx, false))
+}
+
+async function onToolCall($: $T, ctx: Ctx, s: L.Status, agentId: string | undefined): Promise<void> {
+  const now = await $.clock.now()
+  const block = await getJSON<L.Block>($, KEY_BLOCK)
+  if (L.isActive(block, now)) await note($, ctx, s, now, ctx.lastCfg, block, agentId)
+}
+
+async function guardPrompt($: $T, ctx: Ctx): Promise<string | undefined> {
+  const snap = await snapshot($, ctx, true)
+  if (snap.status.blocks) return L.refusalText(snap.status, snap.now, snap.cfg.timeZone, 'prompt')
+  await react($, ctx, snap).catch(() => undefined)
+  return undefined
+}
+
+async function guardAgent($: $T, ctx: Ctx): Promise<string | undefined> {
+  const snap = await snapshot($, ctx, true)
+  return snap.status.blocks ? L.refusalText(snap.status, snap.now, snap.cfg.timeZone, 'agent') : undefined
+}
+
+function failOpenWarn($: $T, what: string): void {
+  $.ui.toast(`⚠ bringback5hourlimit: its ${what} check failed; allowing (fail-open).`, { timeoutMs: 8000 })
+}
+
+async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
+  const snap = await snapshot($, ctx, false)
+  const cmd = L.parseCommand(args, snap.status.strategy)
+  const tz = snap.cfg.timeZone
+  switch (cmd.kind) {
+    case 'error':
+      return cmd.message
+    case 'status':
+      return (
+        L.statusText(snap.status, snap.cfg, snap.now, snap.block, snap.control, snap.invalid) +
+        (snap.isIdle ? '\n  No active block: the next one starts with your next prompt.' : '')
+      )
+    case 'off': {
+      const until =
+        snap.status.strategy === 'official' ? snap.status.resetsAt
+        : snap.isIdle ? snap.now + snap.cfg.windowHours * HOUR
+        : snap.block.endsAt
+      await $.store.set(KEY_CONTROL, { ...snap.control, offUntil: until })
+      await snapshot($, ctx, false)
+      return `Cap paused until ${L.formatReset(until, snap.now, tz)}. /5h on to resume.`
+    }
+    case 'on': {
+      await $.store.set(KEY_CONTROL, {})
+      await snapshot($, ctx, false)
+      return 'Cap on.'
+    }
+    case 'unlock': {
+      const live = await snapshot($, ctx, true)
+      await $.store.set(KEY_CONTROL, { ...live.control, unlockedBlock: live.block.startedAt })
+      await snapshot($, ctx, false)
+      return `Unlocked for this block (one-time). The cap re-engages at ${L.formatReset(live.block.endsAt, live.now, tz)}. /5h on to re-lock now.`
+    }
+    case 'reset': {
+      await $.store.delete(KEY_OVERRIDES)
+      await snapshot($, ctx, false)
+      return 'All /5h set overrides cleared; using /config, env vars and defaults.'
+    }
+    case 'set': {
+      const current = (await getJSON<Record<string, unknown>>($, KEY_OVERRIDES)) ?? {}
+      const r = L.applySet(current, cmd.key, cmd.value)
+      if ('error' in r) return `${r.error} ${L.USAGE}`
+      await $.store.set(KEY_OVERRIDES, r.overrides)
+      const after = await snapshot($, ctx, false)
+      return `Set ${cmd.key} = ${String(r.overrides[cmd.key])}.\n${L.bandText(after.status, after.now, after.cfg.timeZone, 160, after.isIdle)}`
+    }
+  }
+}
+
+// ------------------------------------------------------------ register
+
+export const register: Register = (on, options) => {
+  const ctx: Ctx = {
+    options: { ...options },
+    sessionId: '',
+    lastCfg: L.DEFAULTS,
+    lastStatus: undefined,
+    mainTurnRunning: false,
+    toasted: new Set(),
+    noted: new Set(),
+  }
+
+  on('session.start', async ($, e, next) => {
+    await onSessionStart($, ctx).catch(err => logError($, err))
+    $.clock.every(REFRESH_MS, () => onTick($, ctx))
+    return next(e)
+  })
+
+  on('session.measure', async ($, e, next) => {
+    await onMeasure($, ctx, e.rateLimits, e.changed).catch(err => logError($, err))
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) ctx.mainTurnRunning = true
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    await onTurnComplete($, ctx, e.usage).catch(err => logError($, err))
+    if (e.agentId === undefined) ctx.mainTurnRunning = false
+    return next(e)
+  })
+
+  // Observe only: work running past the cap gets the wrap-up note once.
+  on('tool.call', async ($, e, next) => {
+    const s = ctx.lastStatus
+    if (s?.level === 'cap') await onToolCall($, ctx, s, e.agentId).catch(err => logError($, err))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('prompt.submit', async ($, e, next) => {
+    if (!L.isNewWork(e)) return next(e)
+    const refusal = await guardPrompt($, ctx)
+    return refusal ? { drop: refusal } : next(e)
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    if (ctx.lastCfg.failMode === 'closed') {
+      return { drop: 'bringback5hourlimit: the usage check failed and fail mode is "closed". /5h off to pause.' }
+    }
+    failOpenWarn($, 'prompt')
+    return next(e)
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const refusal = await guardAgent($, ctx)
+    return refusal ? { deny: refusal } : next(e)
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    if (ctx.lastCfg.failMode === 'closed') return { deny: 'bringback5hourlimit: the usage check failed and fail mode is "closed".' }
+    failOpenWarn($, 'agent')
+    return next(e)
+  })
+
+  on('command.run', { command: '5h' }, async ($, e) => ({ text: await runCommand($, ctx, e.args) }))
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const v = await read($, view)
+    if (!v || !v.show || e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const isHard = v.level === 'cap' || (v.level === 'failing' && ctx.lastCfg.failMode === 'closed')
+    const color = isHard ? 'error' : v.level === 'warn' || v.level === 'failing' ? 'warning' : undefined
+    const cols = e.props.bodyColumns
+    const text = v.text.length > cols ? v.text.slice(0, Math.max(0, cols - 1)) + '…' : v.text
+    return (
+      <Box>
+        <Text color={color} dimColor={color === undefined}>{text}</Text>
+      </Box>
+    )
+  })
+}

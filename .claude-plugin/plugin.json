@@ -1,0 +1,67 @@
+{
+  "name": "bringback5hourlimit",
+  "version": "1.0.0",
+  "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code (works on verified Ultra, Max, Pro, and offline).",
+  "author": { "name": "GagnDeep" },
+  "license": "MIT",
+  "keywords": ["usage limit", "5-hour limit", "rate limit", "claude ultra", "weekly limit", "budget", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "windowHours": {
+      "type": "number",
+      "title": "Block length (hours)",
+      "description": "Length of one rolling block. 5 recreates the old 5-hour limit. Env: BB5H_WINDOW_HOURS.",
+      "default": 5
+    },
+    "mode": {
+      "type": "string",
+      "title": "Measuring strategy",
+      "description": "auto picks the best available: Anthropic's 5-hour %, else weekly-% delta, else local token count. official, weekly or tokens forces one. Env: BB5H_MODE.",
+      "default": "auto",
+      "options": ["auto", "official", "weekly", "tokens"]
+    },
+    "officialCapPct": {
+      "type": "number",
+      "title": "Cap on Anthropic's 5-hour % (official)",
+      "description": "Block new work when Anthropic's own 5-hour window reaches this %. Env: BB5H_OFFICIAL_CAP_PCT.",
+      "default": 90
+    },
+    "weeklyBudgetPct": {
+      "type": "number",
+      "title": "Block budget, % of weekly (weekly)",
+      "description": "How much of the weekly limit one block may spend. 15 is about 6-7 full blocks a week; not Anthropic's old ratio. Env: BB5H_BLOCK_BUDGET_PCT_OF_WEEKLY.",
+      "default": 15
+    },
+    "tokenBudget": {
+      "type": "number",
+      "title": "Block budget, tokens (tokens)",
+      "description": "Weighted tokens per block (input + output + cache writes + 10% of cache reads), summed over all sessions. Env: BB5H_TOKEN_BUDGET.",
+      "default": 10000000
+    },
+    "warnPct": {
+      "type": "number",
+      "title": "Warn at (% of block budget)",
+      "description": "Show a warning at this share of the budget. Env: BB5H_WARN_PCT.",
+      "default": 80
+    },
+    "failMode": {
+      "type": "string",
+      "title": "When usage can't be measured",
+      "description": "open allows work and shows a warning; closed refuses new work. Env: BB5H_FAIL_MODE.",
+      "default": "open",
+      "options": ["open", "closed"]
+    },
+    "showBar": {
+      "type": "boolean",
+      "title": "Live bar above the prompt",
+      "description": "Show the block %, reset time, strategy and weekly % above the prompt. Env: BB5H_SHOW_BAR.",
+      "default": true
+    },
+    "timeZone": {
+      "type": "string",
+      "title": "Time zone for reset times",
+      "description": "IANA zone like Asia/Kolkata or America/New_York. Empty uses the system zone. Env: BB5H_TIMEZONE.",
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "bringback5hourlimit",
+  "owner": {
+    "name": "GagnDeep"
+  },
+  "plugins": [
+    {
+      "name": "bringback5hourlimit",
+      "source": "./",
+      "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code."
+    }
+  ],
+  "description": "Bring back the Claude Code 5-hour usage limit as a local, self-imposed rolling cap."
+}
