@@ -8,7 +8,7 @@ When your 5-hour budget runs out, new prompts and new subagents are refused unti
 5h limit ███████░░░ 72% used · resets in 2h 13m (3:40 PM) · week 41%
 ```
 
-By default the bar sits **below the input**, at the end of the hint line, so it takes no extra row. Prefer a band of its own **above the input**? Run `/5h bar above`. `/5h bar` toggles it on and off.
+By default the bar is its own band **above the input**: grey normally, yellow near the limit, red at it. Prefer it **below the input**, at the end of the hint line with no extra row? Run `/5h bar below`. `/5h bar` toggles it on and off.
 
 The bar fits the space it has. On a narrow terminal it shrinks to `5h ████░░ 72% · 2h 13m left · wk 41%`, then to `5h 72% · 2h 13m`. It's a quiet grey normally, yellow near the limit, red once the limit is reached (`5h limit reached · new prompts & agents paused · resets in 1h 2m`), and `≈` marks a local estimate.
 
@@ -40,7 +40,7 @@ It works with the defaults, so there's nothing to set up. You'll need Claude Cod
 | `/5h set <key> <value>` | Changes a setting. Keys: `hours`, `budget`, `tokens`, `cap`, `warn`, `mode`, `fail`, `bar`, `tz`. |
 | `/5h set <number>` | Sets the budget for the strategy that's active now, e.g. `/5h set 20` or `/5h set 5m`. |
 | `/5h bar` | Toggles the live bar on and off. |
-| `/5h bar below` / `/5h bar above` | Puts the bar under the input (default; no extra row) or in its own band above it. |
+| `/5h bar above` / `/5h bar below` | Puts the bar in its own band above the input (default) or at the end of the hint line under it (no extra row). |
 | `/5h reset` | Clears every `/5h set` override. |
 
 `/5h` always works, even when you're capped.
@@ -63,7 +63,7 @@ Settings are read in this order, and the first one found wins:
 | `warnPct` | `BB5H_WARN_PCT` | `80` | Warns you at this % of the block budget. |
 | `failMode` | `BB5H_FAIL_MODE` | `open` | What happens if usage can't be measured. `open` allows work and shows a warning. `closed` refuses new work. |
 | `showBar` | `BB5H_SHOW_BAR` | `true` | Shows the live usage bar. |
-| `barPosition` | `BB5H_BAR_POSITION` | `below` | `below`: on the hint line under the input. `above`: its own band above the input. |
+| `barPosition` | `BB5H_BAR_POSITION` | `above` | `above`: its own band above the input. `below`: on the hint line under the input. |
 | `timeZone` | `BB5H_TIMEZONE` | system | Time zone for reset times, e.g. `Asia/Kolkata`. |
 
 ## How usage is measured

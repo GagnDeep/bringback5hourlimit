@@ -257,17 +257,17 @@ describe('/5h commands', () => {
   const HINT = { plugin: 'bringback5hourlimit', component: 'PromptHint', requestId: 'hint', surface: 'terminal', viewport: { columns: 140, rows: 40 }, props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } } as never
   const BAND = { plugin: 'bringback5hourlimit', component: 'AbovePrompt', requestId: 'above', surface: 'terminal', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 140, scroll: { offset: 0, bodyRows: 3 }, view: {} } } as never
 
-  test('default placement: the bar rides on the hint line under the input', async ($, on) => {
+  test('default placement: the bar is a band above the input; the hint line is untouched', async ($, on) => {
     world(on, { rateLimits: ULTRA(40) })
     ENGINE_DRAWS(on)
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
-    const hint = await $.ui.mount(HINT)
-    expect((await hint.find({ type: 'Text' }))?.text).toMatch(/^\? for shortcuts 5h limit ░{10} 0% used · resets in 5h 0m \(.+\) · week 40%$/)
-    await hint.unmount()
     const band = await $.ui.mount(BAND)
-    expect((await band.find({ type: 'Text' }))?.text).toBe('engine')
+    expect((await band.find({ type: 'Text', text: /0% used/ }))?.text).toBe(' 0% used')
     await band.unmount()
+    const hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+    await hint.unmount()
   })
 
   test('/5h bar toggles; /5h bar above moves it above the input, /5h bar below back', async ($, on) => {
@@ -279,8 +279,7 @@ describe('/5h commands', () => {
     let hint = await $.ui.mount(HINT)
     expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
     await hint.unmount()
-    expect((await $.command.run(cmd('bar'))).text).toMatch(/Bar on \(below the prompt\)/)
-    await $.command.run(cmd('bar above'))
+    expect((await $.command.run(cmd('bar'))).text).toMatch(/Bar on \(above the prompt\)/)
     const band = await $.ui.mount(BAND)
     expect((await band.find({ type: 'Text', text: /0% used/ }))?.text).toBe(' 0% used')
     expect((await band.find({ type: 'Text', text: /week 40%/ }))?.text).toBe(' · week 40%')
@@ -299,6 +298,7 @@ describe('/5h commands', () => {
     ENGINE_DRAWS(on)
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
+    await $.command.run(cmd('bar below'))
     w.setLimits(ULTRA(53))
     await $.session.measure(measureInput(ULTRA(53)))
     let hint = await $.ui.mount(HINT)

@@ -107,11 +107,11 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 
 ## UI
 Two placements (`barPosition`, `/5h bar above|below`; `/5h bar` toggles):
-- **below** (default): `PromptHint`'s `tail`, at the end of the dim hint line under the input.
+- **below**: `PromptHint`'s `tail`, at the end of the dim hint line under the input.
   - It takes no row, and the engine's line and pills stay live.
   - The room for it is the row less the indent, the engine's mode indicator (not reported to mods; 26 cells are reserved whenever the hint offers shift+tab), the hint, any other tail and the separator.
   - The tail is drawn dim, so `⚠` / `⛔` mark warn and cap.
-- **above**: the `AbovePrompt` band with `marginTop={1}`, so there's one blank row above and the engine's one blank row below.
+- **above** (default): the `AbovePrompt` band with `marginTop={1}`, so there's one blank row above and the engine's one blank row below.
 
 The band itself is a one-line band laid out for the width it has (`bandLayout`, pure). It uses the richest variant that fits:
 

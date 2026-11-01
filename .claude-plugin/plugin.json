@@ -1,6 +1,6 @@
 {
   "name": "bringback5hourlimit",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code (works on verified Ultra, Max, Pro, and offline).",
   "author": {
     "name": "GagnDeep"
@@ -78,11 +78,11 @@
     "barPosition": {
       "type": "string",
       "title": "Bar position",
-      "description": "below: at the end of the hint line under the input (takes no extra row). above: its own band above the input. /5h bar above|below switches. Env: BB5H_BAR_POSITION.",
-      "default": "below",
+      "description": "above: its own band above the input (default). below: at the end of the hint line under the input (takes no extra row). /5h bar above|below switches. Env: BB5H_BAR_POSITION.",
+      "default": "above",
       "options": [
-        "below",
-        "above"
+        "above",
+        "below"
       ]
     },
     "timeZone": {

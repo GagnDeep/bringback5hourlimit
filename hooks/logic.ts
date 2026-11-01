@@ -31,7 +31,7 @@ export const DEFAULTS: Config = {
   warnPct: 80,
   failMode: 'open',
   showBar: true,
-  barPosition: 'below',
+  barPosition: 'above',
   timeZone: '',
 }
 
