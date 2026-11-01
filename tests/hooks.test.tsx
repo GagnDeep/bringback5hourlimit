@@ -30,12 +30,12 @@ describe('verified Ultra (weekly window only)', () => {
     w.setLimits(ULTRA(55)) // +15 = 100%
     await $.session.measure(measureInput(ULTRA(55)))
     const refused = await $.prompt.submit(prompt('more'))
-    expect(refused.drop).toMatch(/budget is spent/)
-    expect(refused.drop).toMatch(/weekly-Δ 15\/15% wk/)
+    expect(refused.drop).toMatch(/limit is reached/)
+    expect(refused.drop).toMatch(/15% of your week \(budget 15%\)/)
     // 06:00 UTC + 5h = 11:00 UTC = 4:30 PM IST
     expect(refused.drop).toMatch(/Resets 4:30\sPM (IST|GMT\+5:30) \(in 4h 30m\)/)
     const agent = await $.agent.spawn(spawnInput())
-    expect(agent.deny).toMatch(/New agent refused/)
+    expect(agent.deny).toMatch(/New agent not started/)
     expect(w.notifications.length).toBe(1)
   })
 
@@ -47,7 +47,7 @@ describe('verified Ultra (weekly window only)', () => {
     await $.session.measure(measureInput(ULTRA(60)))
     expect((await $.prompt.submit(prompt('x', { origin: { kind: 'task-notification' } }))).drop).toBe(undefined)
     expect((await $.prompt.submit(prompt('/5h status', { command: { name: '5h', args: 'status' } }))).drop).toBe(undefined)
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/budget is spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
   })
 
   test('the block expires at 5 hours and the next prompt starts a fresh one', async ($, on) => {
@@ -56,7 +56,7 @@ describe('verified Ultra (weekly window only)', () => {
     await $.prompt.submit(prompt('start'))
     w.setLimits(ULTRA(60))
     await $.session.measure(measureInput(ULTRA(60)))
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
     await w.clock.advance(5 * HOUR)
     const after = await $.prompt.submit(prompt('new block'))
     expect(after.drop).toBe(undefined)
@@ -85,7 +85,7 @@ describe('official 5-hour window present (Max / Pro / unverified Ultra)', () => 
     expect((await $.prompt.submit(prompt('a'))).drop).toBe(undefined)
     w.setLimits(MAX(91))
     const r = await $.prompt.submit(prompt('b'))
-    expect(r.drop).toMatch(/anthropic-5h 91\/90%/)
+    expect(r.drop).toMatch(/Anthropic 5h at 91% \(cap 90%\)/)
     expect(r.drop).toMatch(/Resets 1:30\sPM/) // 08:00 UTC
   })
 })
@@ -100,9 +100,9 @@ describe('no usage data (offline / API changed)', () => {
     expect((await $.prompt.submit(prompt('b'))).drop).toBe(undefined)
     await $.turn.complete(turnDone({ cache_read_input_tokens: 100_000 }))
     const r = await $.prompt.submit(prompt('c'))
-    expect(r.drop).toMatch(/tokens 100k\/100k tok/)
+    expect(r.drop).toMatch(/100k of 100k tokens/)
     const status = await $.command.run(cmd('status'))
-    expect(status.text).toMatch(/no usage data; counting tokens locally/)
+    expect(status.text).toMatch(/tokens counted on this machine \(Anthropic sent no usage data, so this is an estimate\)/)
   })
 
   test('mode=tokens budgets by tokens even when percentages exist', async ($, on) => {
@@ -110,7 +110,7 @@ describe('no usage data (offline / API changed)', () => {
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
     await $.turn.complete(turnDone({ output_tokens: 1000 }))
-    expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/tokens 1k\/1k tok/)
+    expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/1k of 1k tokens/)
   })
 })
 
@@ -126,7 +126,7 @@ describe('two concurrent sessions share one block', () => {
     expect(w.store.get('block')).toEqual(expect.objectContaining({ startedAt: T0 - HOUR }))
     await $.turn.complete(turnDone({ output_tokens: 100 }))
     expect(w.store.get('tok:sess-B')).toEqual(expect.objectContaining({ blockStart: T0 - HOUR, tokens: 100 }))
-    expect((await $.prompt.submit(prompt('b2'))).drop).toMatch(/1k\/1k tok/)
+    expect((await $.prompt.submit(prompt('b2'))).drop).toMatch(/1k of 1k tokens/)
   })
 
   test('a later block written by another session loses to the earlier active one', async ($, on) => {
@@ -151,15 +151,15 @@ describe('/5h commands', () => {
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
     const s = (await $.command.run(cmd('status'))).text ?? ''
-    expect(s).toMatch(/Strategy: weekly-Δ \(mode auto\) · weekly 40%/)
-    expect(s).toMatch(/resets 4:30\sPM/)
+    expect(s).toMatch(/This week: 40% used, resets/)
+    expect(s).toMatch(/Resets 4:30\sPM/)
     expect(w.store.get('block')).toBeDefined()
   })
 
   test('unlock lifts the cap once for this block; the next block enforces again', async ($, on) => {
     const w = world(on, { rateLimits: ULTRA(40) })
     await capped($, w)
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
     expect((await $.command.run(cmd('unlock'))).text).toMatch(/Unlocked for this block/)
     expect((await $.prompt.submit(prompt('x'))).drop).toBe(undefined)
     expect((await $.agent.spawn(spawnInput())).deny).toBe(undefined)
@@ -167,7 +167,7 @@ describe('/5h commands', () => {
     await $.prompt.submit(prompt('new block'))
     w.setLimits(ULTRA(80))
     await $.session.measure(measureInput(ULTRA(80)))
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
   })
 
   test('off pauses until the reset; on re-enables', async ($, on) => {
@@ -176,7 +176,7 @@ describe('/5h commands', () => {
     expect((await $.command.run(cmd('off'))).text).toMatch(/Cap paused until/)
     expect((await $.prompt.submit(prompt('x'))).drop).toBe(undefined)
     expect((await $.command.run(cmd('on'))).text).toBe('Cap on.')
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
   })
 
   test('set changes a budget, validates, and reset restores defaults', async ($, on) => {
@@ -187,7 +187,7 @@ describe('/5h commands', () => {
     expect((await $.command.run(cmd('set hours -2'))).text).toMatch(/Invalid value/)
     expect((await $.command.run(cmd('set hours 3'))).text).toMatch(/Set windowHours = 3/)
     expect((await $.command.run(cmd('reset'))).text).toMatch(/overrides cleared/)
-    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/spent/)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
   })
 
   test('bar off hides the band; bar on shows it', async ($, on) => {
@@ -201,7 +201,8 @@ describe('/5h commands', () => {
     await $.prompt.submit(prompt('a'))
     const band = { plugin: 'bringback5hourlimit', component: 'AbovePrompt', requestId: 'above', surface: 'terminal', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 140, scroll: { offset: 0, bodyRows: 3 } } } as never
     let ui = await $.ui.mount(band)
-    expect((await ui.find({ type: 'Text', text: /5h .* 0%/ }))?.text).toMatch(/weekly-Δ 0\/15% wk · wk 40%/)
+    expect((await ui.find({ type: 'Text', text: /0% used/ }))?.text).toBe(' 0% used')
+    expect((await ui.find({ type: 'Text', text: /week 40%/ }))?.text).toBe(' · week 40%')
     await ui.unmount()
     await $.command.run(cmd('bar off'))
     ui = await $.ui.mount(band)
@@ -240,7 +241,7 @@ describe('fail-open and fail-closed when the usage source errors', () => {
   test('forced weekly mode with no data, fail-closed: refuses with the reason', async ($, on) => {
     world(on, { usageThrows: true, env: { BB5H_MODE: 'weekly', BB5H_FAIL_MODE: 'closed' } })
     await $.session.start(START)
-    expect((await $.prompt.submit(prompt('a'))).drop).toMatch(/can't be measured \(no weekly window reported\) and fail mode is "closed"/)
+    expect((await $.prompt.submit(prompt('a'))).drop).toMatch(/usage can't be read \(no weekly window reported\) and fail mode is "closed"/)
     expect((await $.agent.spawn(spawnInput())).deny).toMatch(/fail mode is "closed"/)
   })
 
@@ -268,6 +269,6 @@ describe('configuration', () => {
     expect(w.store.get('block')).toEqual(expect.objectContaining({ endsAt: T0 + 3 * HOUR }))
     w.setLimits(ULTRA(45))
     await $.session.measure(measureInput(ULTRA(45)))
-    expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/3h budget is spent/)
+    expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/3h limit is reached/)
   })
 })

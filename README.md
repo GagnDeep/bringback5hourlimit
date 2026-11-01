@@ -5,8 +5,10 @@ A Claude Code mod that brings back the **rolling 5-hour usage limit** as a **loc
 When your 5-hour budget runs out, new prompts and new subagents are refused until the block resets. The work already running is allowed to finish. This means a runaway agent or a late night can't burn a big share of your weekly limit in one go.
 
 ```
-5h ███████░░░ 72% · resets 3:40 PM IST (in 2h 13m) · weekly-Δ 10.8/15% wk · wk 41%
+5h limit ━━━━━━━━──── 72% used · resets in 2h 13m (3:40 PM) · week 41%
 ```
+
+The bar fits the space it has. On a narrow terminal it shrinks to `5h ━━━━── 72% · 2h 13m left · wk 41%`, then to `5h 72% · 2h 13m`. It's green normally, yellow near the limit, red once the limit is reached (`5h limit reached · new prompts & agents paused · resets in 1h 2m`), and `≈` marks a local estimate.
 
 ## Install
 
@@ -29,7 +31,7 @@ It works with the defaults, so there's nothing to set up. You'll need Claude Cod
 
 | Command | What it does |
 |---|---|
-| `/5h` or `/5h status` | Shows block %, reset time (in your local time zone), active strategy and weekly %. |
+| `/5h` or `/5h status` | Shows block %, reset time (in your local time zone), how usage is measured, and your weekly %. |
 | `/5h off` | Pauses the cap until the current block resets. |
 | `/5h on` | Turns the cap back on and clears `off` and `unlock`. |
 | `/5h unlock` | One-time override. It lifts the cap for the rest of this block only. |

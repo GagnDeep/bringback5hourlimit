@@ -1,3 +1,5 @@
+import type { BandData } from '../types'
+
 // Pure, side-effect-free logic for bringback5hourlimit.
 // Nothing here touches `$`, the clock or storage: every input is passed in,
 // so each function is unit-testable on its own.
@@ -289,6 +291,7 @@ export type Status = {
   budget: number
   resetsAt: number
   weeklyPct?: number
+  weeklyResetsAt?: number
   windowLabel: string
   /** True when the cap applies to new work now. */
   blocks: boolean
@@ -308,6 +311,7 @@ export function evaluate(x: EvalInput): Status {
   const sel = selectStrategy(cfg, limits, now)
   const fresh = isFresh(limits, now, cfg) ? limits : undefined
   const weeklyPct = fresh?.sevenDay?.pct
+  const weeklyResetsAt = fresh?.sevenDay?.resetsAt
   let used: number
   let budget: number
   let resetsAt = block.endsAt
@@ -316,7 +320,7 @@ export function evaluate(x: EvalInput): Status {
   if (!sel.available) {
     return {
       strategy: sel.strategy, degraded: true, reason: sel.reason, level: 'failing', pct: 0, used: 0,
-      budget: 0, resetsAt, weeklyPct, windowLabel, blocks: cfg.failMode === 'closed',
+      budget: 0, resetsAt, weeklyPct, weeklyResetsAt, windowLabel, blocks: cfg.failMode === 'closed',
     }
   }
   if (sel.strategy === 'official' && fresh?.fiveHour) {
@@ -339,7 +343,7 @@ export function evaluate(x: EvalInput): Status {
   else if (control.unlockedBlock !== undefined && control.unlockedBlock === block.startedAt) level = 'unlocked'
   return {
     strategy: sel.strategy, degraded: sel.degraded, reason: sel.reason, level, pct, used, budget,
-    resetsAt, weeklyPct, windowLabel, blocks: level === 'cap',
+    resetsAt, weeklyPct, weeklyResetsAt, windowLabel, blocks: level === 'cap',
   }
 }
 
@@ -366,6 +370,14 @@ export function round1(n: number): number {
 
 function trimNum(n: number): string {
   return Number.isInteger(n) ? String(n) : String(round1(n))
+}
+
+function systemZone(): string {
+  try {
+    return new Intl.DateTimeFormat().resolvedOptions().timeZone || 'system zone'
+  } catch {
+    return 'system zone'
+  }
 }
 
 export function formatDuration(ms: number): string {
@@ -399,55 +411,140 @@ export function formatTokens(n: number): string {
   return String(n)
 }
 
+export function formatClockShort(ms: number, timeZone: string, now?: number): string {
+  const opts: Intl.DateTimeFormatOptions = { hour: 'numeric', minute: '2-digit' }
+  if (timeZone) opts.timeZone = timeZone
+  if (now !== undefined && ms - now > 20 * HOUR) opts.weekday = 'short'
+  try {
+    return new Intl.DateTimeFormat('en-US', opts).format(new Date(ms))
+  } catch {
+    return new Date(ms).toISOString().slice(11, 16)
+  }
+}
+
+/** How usage is measured, in plain words. */
 export function strategyLabel(s: Strategy): string {
-  return s === 'official' ? 'anthropic-5h' : s === 'weekly' ? 'weekly-Δ' : 'tokens'
+  return s === 'official' ? "Anthropic's 5h limit" : s === 'weekly' ? 'share of your week' : 'local token count'
 }
 
+/** What was spent against what is allowed, in plain words. */
 export function usedText(s: Status): string {
-  if (s.strategy === 'tokens') return `${formatTokens(s.used)}/${formatTokens(s.budget)} tok`
-  if (s.strategy === 'weekly') return `${round1(s.used)}/${trimNum(s.budget)}% wk`
-  return `${round1(s.used)}/${trimNum(s.budget)}%`
+  if (s.strategy === 'tokens') return `${formatTokens(s.used)} of ${formatTokens(s.budget)} tokens`
+  if (s.strategy === 'weekly') return `${round1(s.used)}% of your week (budget ${trimNum(s.budget)}%)`
+  return `Anthropic 5h at ${round1(s.used)}% (cap ${trimNum(s.budget)}%)`
 }
 
-export function meter(pct: number, width = 10): string {
-  const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)))
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
+// ---------------------------------------------------------------- the band
+
+export type { BandData }
+
+export type Tone = 'label' | 'text' | 'dim' | 'track' | 'ok' | 'warn' | 'error'
+export type Segment = { text: string; tone: Tone }
+
+export function bandData(s: Status, now: number, cfg: Config, idle: boolean, control: Control): BandData {
+  const d: BandData = {
+    level: s.level, pct: s.pct, resetsAt: s.resetsAt, now, idle: idle && s.strategy !== 'official',
+    isEstimate: s.strategy === 'tokens' && s.degraded, windowLabel: s.windowLabel,
+    failMode: cfg.failMode, timeZone: cfg.timeZone,
+  }
+  if (s.weeklyPct !== undefined) d.weeklyPct = s.weeklyPct
+  if (s.reason !== undefined) d.reason = s.reason
+  if (control.offUntil !== undefined) d.offUntil = control.offUntil
+  return d
 }
 
-export function bandText(s: Status, now: number, timeZone: string, columns = 120, idle = false): string {
-  if (s.level === 'failing') {
-    return `⚠ ${s.windowLabel} cap not enforcing (${s.reason ?? 'no data'}) · /5h status`
-  }
-  const head = s.degraded ? '⚠ ' : ''
-  if (idle && s.strategy !== 'official') {
-    const off = s.level === 'off' ? ' · OFF' : ''
-    const wk = s.weeklyPct !== undefined ? ` · wk ${Math.round(s.weeklyPct)}%` : ''
-    return `${head}${s.windowLabel} idle${off} · next block starts with your next prompt · ${strategyLabel(s.strategy)}${wk}`
-  }
-  const tag = s.level === 'off' ? ' · OFF' : s.level === 'unlocked' ? ' · UNLOCKED' : s.level === 'cap' ? ' · CAP' : ''
-  const parts = [
-    `${head}${s.windowLabel} ${meter(s.pct)} ${Math.floor(s.pct)}%${tag}`,
-    `resets ${formatReset(s.resetsAt, now, timeZone)}`,
-    `${strategyLabel(s.strategy)} ${usedText(s)}`,
-  ]
-  if (s.weeklyPct !== undefined) parts.push(`wk ${Math.round(s.weeklyPct)}%`)
-  let out = parts.join(' · ')
-  while (out.length > columns && parts.length > 2) {
-    parts.pop()
-    out = parts.join(' · ')
-  }
+const width = (segs: readonly Segment[]) => segs.reduce((n, s) => n + [...s.text].length, 0)
+
+function bar(pct: number, cells: number, tone: Tone): Segment[] {
+  const filled = Math.max(pct > 0 ? 1 : 0, Math.min(cells, Math.round((pct / 100) * cells)))
+  const out: Segment[] = []
+  if (filled > 0) out.push({ text: '━'.repeat(filled), tone })
+  if (cells - filled > 0) out.push({ text: '─'.repeat(cells - filled), tone: 'track' })
   return out
 }
 
+/**
+ * The band, laid out for `columns` cells: the richest variant that fits,
+ * down to a few characters. Pure: `now` and every number come in `d`.
+ */
+export function bandLayout(d: BandData, columns: number): Segment[] {
+  const W = d.windowLabel
+  const left = formatDuration(d.resetsAt - d.now)
+  const clock = formatClockShort(d.resetsAt, d.timeZone, d.now)
+  const wk = d.weeklyPct !== undefined ? Math.round(d.weeklyPct) : undefined
+  const pctText = `${d.isEstimate ? '≈' : ''}${Math.floor(d.pct)}%`
+  const t = (text: string, tone: Tone = 'dim'): Segment => ({ text, tone })
+  const week = (long: boolean): Segment[] => (wk === undefined ? [] : [t(long ? ` · week ${wk}%` : ` · wk ${wk}%`)])
+  let variants: Segment[][]
+
+  switch (d.level) {
+    case 'failing': {
+      const closed = d.failMode === 'closed'
+      const tone: Tone = closed ? 'error' : 'warn'
+      variants = [
+        [t(`⚠ ${W} limit not active`, tone), t(` · can't read usage (${d.reason ?? 'no data'})`), t(closed ? ' · new prompts paused' : ' · allowing work'), t(' · /5h status')],
+        [t(`⚠ ${W} limit not active`, tone), t(closed ? ' · new prompts paused' : ' · allowing work'), t(' · /5h status')],
+        [t(`⚠ ${W} limit not active`, tone)],
+        [t(`⚠ ${W}`, tone)],
+      ]
+      break
+    }
+    case 'off': {
+      const until = d.offUntil ?? d.resetsAt
+      variants = [
+        [t(`${W} limit`, 'label'), t(` paused until ${formatClockShort(until, d.timeZone, d.now)} (in ${formatDuration(until - d.now)})`), ...week(true), t(' · /5h on to resume')],
+        [t(`${W} limit`, 'label'), t(` paused · ${formatDuration(until - d.now)} left`), ...week(false)],
+        [t(`${W} paused`, 'label')],
+      ]
+      break
+    }
+    case 'cap':
+      variants = [
+        [t(`${W} limit reached`, 'error'), t(' · new prompts & agents paused'), t(` · resets in ${left} (${clock})`, 'text'), t(' · /5h unlock to override')],
+        [t(`${W} limit reached`, 'error'), t(` · resets in ${left} (${clock})`, 'text'), t(' · /5h unlock')],
+        [t(`${W} limit reached`, 'error'), t(` · back in ${left}`, 'text')],
+        [t(`${W} ⛔ ${left}`, 'error')],
+      ]
+      break
+    default: {
+      if (d.idle) {
+        variants = [
+          [t(`${W} limit`, 'label'), t(' ready', 'ok'), t(' · starts with your next prompt'), ...week(true)],
+          [t(`${W} limit`, 'label'), t(' ready', 'ok'), ...week(false)],
+          [t(`${W}`, 'label'), t(' ready', 'ok')],
+        ]
+        break
+      }
+      const tone: Tone = d.level === 'unlocked' ? 'dim' : d.level === 'warn' ? 'warn' : 'ok'
+      const tag = d.level === 'unlocked' ? [t(' · unlocked', 'warn')] : []
+      const used = `${pctText} used`
+      variants = [
+        [t(`${W} limit `, 'label'), ...bar(d.pct, 12, tone), t(` ${used}`, tone), ...tag, t(` · resets in ${left} (${clock})`), ...week(true)],
+        [t(`${W} limit `, 'label'), ...bar(d.pct, 10, tone), t(` ${used}`, tone), ...tag, t(` · resets in ${left}`), ...week(true)],
+        [t(`${W} `, 'label'), ...bar(d.pct, 6, tone), t(` ${pctText}`, tone), ...tag, t(` · ${left} left`), ...week(false)],
+        [t(`${W} `, 'label'), t(pctText, tone), t(` · ${left}`)],
+        [t(`${W} `, 'label'), t(pctText, tone)],
+      ]
+    }
+  }
+  for (const v of variants) if (width(v) <= columns) return v
+  const last = variants[variants.length - 1]!
+  return [{ text: last.map(s => s.text).join('').slice(0, Math.max(0, columns)), tone: last[0]!.tone }]
+}
+
+/** One line of plain text, for command output. */
+export function bandText(d: BandData, columns = 120): string {
+  return bandLayout(d, columns).map(s => s.text).join('')
+}
+
 export function refusalText(s: Status, now: number, timeZone: string, kind: 'prompt' | 'agent'): string {
-  const what = kind === 'prompt' ? 'Prompt refused' : 'New agent refused'
+  const what = kind === 'prompt' ? 'Prompt not sent' : 'New agent not started'
   if (s.level === 'failing') {
-    return `bringback5hourlimit: ${what}: usage can't be measured (${s.reason}) and fail mode is "closed". /5h set fail open, or /5h off.`
+    return `bringback5hourlimit: ${what}: usage can't be read (${s.reason}) and fail mode is "closed". /5h set fail open, or /5h off.`
   }
   return (
-    `bringback5hourlimit: ${what}: your ${s.windowLabel} budget is spent ` +
-    `(${strategyLabel(s.strategy)} ${usedText(s)}). Resets ${formatReset(s.resetsAt, now, timeZone)}. ` +
-    `/5h unlock lifts it for this block; /5h off pauses it until reset.`
+    `bringback5hourlimit: ${what}: your ${s.windowLabel} limit is reached (${usedText(s)}). ` +
+    `Resets ${formatReset(s.resetsAt, now, timeZone)}. /5h unlock to keep going this block, /5h off to pause until reset.`
   )
 }
 
@@ -529,17 +626,40 @@ export function applySet(overrides: Raw, key: keyof Config, value: string): { ov
   return { overrides: { ...overrides, [key]: parsed.values[key] } }
 }
 
-export function statusText(s: Status, cfg: Config, now: number, block: Block, control: Control, invalid: string[]): string {
+export function statusText(s: Status, cfg: Config, now: number, block: Block, control: Control, invalid: string[], idle = false): string {
   const tz = cfg.timeZone
-  const lines = [
-    `bringback5hourlimit — ${s.level.toUpperCase()}${s.degraded && s.reason ? ` (${s.reason})` : ''}`,
-    `  Block: ${s.windowLabel}, ${Math.floor(s.pct)}% used (${usedText(s)}), resets ${formatReset(s.resetsAt, now, tz)}`,
-    `  Strategy: ${strategyLabel(s.strategy)} (mode ${cfg.mode})` + (s.weeklyPct !== undefined ? ` · weekly ${round1(s.weeklyPct)}%` : ' · weekly n/a'),
-    `  Started: ${formatClock(block.startedAt, tz)} · warn at ${cfg.warnPct}% · fail ${cfg.failMode} · bar ${cfg.showBar ? 'on' : 'off'}`,
-    `  Budgets: anthropic-5h cap ${cfg.officialCapPct}% · weekly-Δ ${cfg.weeklyBudgetPct}% of weekly · tokens ${formatTokens(cfg.tokenBudget)} per ${trimNum(cfg.windowHours)}h`,
-  ]
-  if (control.offUntil !== undefined && now < control.offUntil) lines.push(`  Paused until ${formatClock(control.offUntil, tz, now)} (/5h on to resume)`)
-  if (s.level === 'unlocked') lines.push('  Unlocked for this block (/5h on to re-lock)')
+  const W = s.windowLabel
+  const headline: Record<Level, string> = {
+    ok: `${Math.floor(s.pct)}% used`,
+    warn: `${Math.floor(s.pct)}% used, close to the limit`,
+    cap: 'limit reached: new prompts and agents are paused',
+    off: 'paused (not enforcing)',
+    unlocked: `unlocked for this block (${Math.floor(s.pct)}% used)`,
+    failing: cfg.failMode === 'closed' ? "can't read usage: new prompts are paused" : "can't read usage: not enforcing",
+  }
+  const lines = [`${W} limit: ${idle && s.level === 'ok' && s.strategy !== 'official' ? 'ready (no block running)' : headline[s.level]}`]
+  if (idle && s.strategy !== 'official') lines.push(`  A ${W} block starts with your next prompt.`)
+  else if (s.level !== 'failing') lines.push(`  Resets ${formatReset(s.resetsAt, now, tz)}`)
+  if (s.level === 'failing') {
+    lines.push(`  Why: ${s.reason ?? 'no usage data'}. Fix: /5h set mode auto (falls back to counting tokens).`)
+  } else if (s.strategy === 'weekly') {
+    lines.push(`  Measured as: a share of your weekly limit. Each ${W} block may use ${trimNum(cfg.weeklyBudgetPct)}% of your week;`)
+    lines.push(`    this block has used ${round1(s.used)}%. Change: /5h set budget <percent>`)
+  } else if (s.strategy === 'official') {
+    lines.push(`  Measured as: Anthropic's own 5-hour limit, paused at ${trimNum(cfg.officialCapPct)}% of it (now ${round1(s.used)}%).`)
+    lines.push('    Change: /5h set cap <percent>')
+  } else {
+    lines.push(`  Measured as: tokens counted on this machine${s.degraded ? ' (Anthropic sent no usage data, so this is an estimate)' : ''}.`)
+    lines.push(`    ${formatTokens(s.used)} of ${formatTokens(cfg.tokenBudget)} tokens this block. Change: /5h set tokens <n>, e.g. 5m`)
+  }
+  if (s.weeklyPct !== undefined) {
+    lines.push(`  This week: ${round1(s.weeklyPct)}% used` + (s.weeklyResetsAt !== undefined ? `, resets ${formatClock(s.weeklyResetsAt, tz, now)}` : ''))
+  }
+  if (control.offUntil !== undefined && now < control.offUntil) lines.push(`  Paused until ${formatClock(control.offUntil, tz, now)}. /5h on to resume.`)
+  if (s.level === 'unlocked') lines.push('  /5h on re-locks it now.')
+  lines.push(`  Settings: ${trimNum(cfg.windowHours)}h blocks · warn at ${trimNum(cfg.warnPct)}% · mode ${cfg.mode} · ` +
+    `if usage can't be read: ${cfg.failMode === 'open' ? 'allow' : 'refuse'} · bar ${cfg.showBar ? 'on' : 'off'}`)
+  lines.push(tz ? `  Times in ${tz}.` : `  Times in ${systemZone()} (system). Yours differs? /5h set tz Asia/Kolkata`)
   if (invalid.length) lines.push(`  Ignored invalid settings: ${[...new Set(invalid)].join(', ')}`)
   return lines.join('\n')
 }

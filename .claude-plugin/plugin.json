@@ -1,10 +1,20 @@
 {
   "name": "bringback5hourlimit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code (works on verified Ultra, Max, Pro, and offline).",
-  "author": { "name": "GagnDeep" },
+  "author": {
+    "name": "GagnDeep"
+  },
   "license": "MIT",
-  "keywords": ["usage limit", "5-hour limit", "rate limit", "claude ultra", "weekly limit", "budget", "mod"],
+  "keywords": [
+    "usage limit",
+    "5-hour limit",
+    "rate limit",
+    "claude ultra",
+    "weekly limit",
+    "budget",
+    "mod"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "windowHours": {
@@ -18,7 +28,12 @@
       "title": "Measuring strategy",
       "description": "auto picks the best available: Anthropic's 5-hour %, else weekly-% delta, else local token count. official, weekly or tokens forces one. Env: BB5H_MODE.",
       "default": "auto",
-      "options": ["auto", "official", "weekly", "tokens"]
+      "options": [
+        "auto",
+        "official",
+        "weekly",
+        "tokens"
+      ]
     },
     "officialCapPct": {
       "type": "number",
@@ -49,7 +64,10 @@
       "title": "When usage can't be measured",
       "description": "open allows work and shows a warning; closed refuses new work. Env: BB5H_FAIL_MODE.",
       "default": "open",
-      "options": ["open", "closed"]
+      "options": [
+        "open",
+        "closed"
+      ]
     },
     "showBar": {
       "type": "boolean",

@@ -8,7 +8,13 @@ import * as L from './logic'
 
 type $T = EngineInterface
 
-const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null)
+// The tag declines what an earlier version stored under this key.
+const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null, { shape: 'band-2' })
+
+const TONE_COLOR: Record<L.Tone, 'success' | 'warning' | 'error' | undefined> = {
+  label: undefined, text: undefined, dim: undefined, track: undefined,
+  ok: 'success', warn: 'warning', error: 'error',
+}
 
 const KEY_BLOCK = 'block'
 const KEY_LIMITS = 'limits'
@@ -126,15 +132,16 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
   const tokens = isIdle ? 0 : await readTokens($, block.startedAt)
   const status = L.evaluate({ cfg, now, block, limits, tokens, control })
   ctx.lastStatus = status
-  await publish($, cfg, status, now, isIdle)
+  await publish($, cfg, status, now, isIdle, control)
   return { cfg, invalid, now, block, isIdle, control, status }
 }
 
-async function publish($: $T, cfg: L.Config, status: L.Status, now: number, isIdle: boolean): Promise<void> {
-  const next: BandView = { text: L.bandText(status, now, cfg.timeZone, 160, isIdle), level: status.level, show: cfg.showBar }
-  await update($, view, prev =>
-    prev && prev.text === next.text && prev.level === next.level && prev.show === next.show ? prev : next,
-  )
+async function publish($: $T, cfg: L.Config, status: L.Status, now: number, isIdle: boolean, control: L.Control): Promise<void> {
+  const data = L.bandData(status, now, cfg, isIdle, control)
+  const next: BandView = { data, show: cfg.showBar }
+  // `now` only matters at minute resolution: skip writes that draw the same.
+  const key = (v: BandView | null) => (v ? JSON.stringify({ ...v.data, now: Math.floor(v.data.now / 60_000) }) + v.show : '')
+  await update($, view, prev => (key(prev) === key(next) ? prev : next))
 }
 
 /** Warnings and the wrap-up note, once per block. */
@@ -253,8 +260,7 @@ async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
       return cmd.message
     case 'status':
       return (
-        L.statusText(snap.status, snap.cfg, snap.now, snap.block, snap.control, snap.invalid) +
-        (snap.isIdle ? '\n  No active block: the next one starts with your next prompt.' : '')
+        L.statusText(snap.status, snap.cfg, snap.now, snap.block, snap.control, snap.invalid, snap.isIdle)
       )
     case 'off': {
       const until =
@@ -287,7 +293,7 @@ async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
       if ('error' in r) return `${r.error} ${L.USAGE}`
       await $.store.set(KEY_OVERRIDES, r.overrides)
       const after = await snapshot($, ctx, false)
-      return `Set ${cmd.key} = ${String(r.overrides[cmd.key])}.\n${L.bandText(after.status, after.now, after.cfg.timeZone, 160, after.isIdle)}`
+      return `Set ${cmd.key} = ${String(r.overrides[cmd.key])}.\n${L.bandText(L.bandData(after.status, after.now, after.cfg, after.isIdle, after.control))}`
     }
   }
 }
@@ -363,13 +369,18 @@ export const register: Register = (on, options) => {
     const v = await read($, view)
     if (!v || !v.show || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    const isHard = v.level === 'cap' || (v.level === 'failing' && ctx.lastCfg.failMode === 'closed')
-    const color = isHard ? 'error' : v.level === 'warn' || v.level === 'failing' ? 'warning' : undefined
-    const cols = e.props.bodyColumns
-    const text = v.text.length > cols ? v.text.slice(0, Math.max(0, cols - 1)) + '…' : v.text
+    const segments = L.bandLayout(v.data, e.props.bodyColumns)
     return (
-      <Box>
-        <Text color={color} dimColor={color === undefined}>{text}</Text>
+      <Box flexDirection="row" flexWrap="nowrap" overflow="hidden">
+        {segments.map(seg => (
+          <Text
+            bold={seg.tone === 'label' || seg.tone === 'error'}
+            color={TONE_COLOR[seg.tone]}
+            dimColor={seg.tone === 'dim' || seg.tone === 'track'}
+          >
+            {seg.text}
+          </Text>
+        ))}
       </Box>
     )
   })

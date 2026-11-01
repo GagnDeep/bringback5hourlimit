@@ -203,17 +203,59 @@ describe('timezone display', () => {
   })
 })
 
-describe('band text', () => {
-  test('idle before the first prompt of a block; full line during one', async () => {
-    const block = L.startBlock(T0, cfg(), 40)
-    const s = L.evaluate({ cfg: cfg(), now: T0, block, limits: ultra(40), tokens: 0, control: {} })
-    expect(L.bandText(s, T0, 'Asia/Calcutta', 160, true)).toBe('5h idle · next block starts with your next prompt · weekly-Δ · wk 40%')
-    expect(L.bandText(s, T0, 'Asia/Calcutta', 160)).toMatch(/^5h ░{10} 0% · resets 4:30\sPM .+ · weekly-Δ 0\/15% wk · wk 40%$/)
+describe('band layout', () => {
+  const at = T0 + HOUR
+  const status = (weekly: number, over: Partial<L.Config> = {}, control: L.Control = {}) => {
+    let b = L.startBlock(T0, cfg(over), 40)
+    b = L.observeWeekly(b, weekly)
+    return { s: L.evaluate({ cfg: cfg(over), now: at, block: b, limits: ultra(weekly, at), tokens: 0, control }), c: cfg(over), control }
+  }
+  const text = (segs: L.Segment[]) => segs.map(x => x.text).join('')
+  const data = (x: ReturnType<typeof status>, idle = false) => L.bandData(x.s, at, { ...x.c, timeZone: 'Asia/Calcutta' }, idle, x.control)
+
+  test('wide: label, bar, % used, countdown with clock, week', async () => {
+    const out = text(L.bandLayout(data(status(46)), 160))
+    expect(out).toMatch(/^5h limit ━{5}─{7} 40% used · resets in 4h 0m \(4:30\sPM\) · week 46%$/)
+    expect(out).not.toMatch(/Δ|wk\b/)
   })
 
-  test('narrow widths drop trailing parts', async () => {
-    const s = L.evaluate({ cfg: cfg(), now: T0, block: L.startBlock(T0, cfg(), 40), limits: ultra(40), tokens: 0, control: {} })
-    expect(L.bandText(s, T0, 'UTC', 60)).not.toMatch(/wk 40%/)
+  test('narrower widths degrade gracefully and always fit', async () => {
+    const d = data(status(46))
+    for (const cols of [160, 90, 70, 50, 40, 24, 12, 8, 4]) {
+      const out = text(L.bandLayout(d, cols))
+      expect([...out].length <= cols).toBe(true)
+    }
+    expect(text(L.bandLayout(d, 160))).toMatch(/\(4:30\sPM\)/)
+    expect(text(L.bandLayout(d, 60))).toBe('5h limit ━━━━────── 40% used · resets in 4h 0m · week 46%')
+    expect(text(L.bandLayout(d, 45))).toBe('5h ━━──── 40% · 4h 0m left · wk 46%')
+    expect(text(L.bandLayout(d, 20))).toBe('5h 40% · 4h 0m')
+    expect(text(L.bandLayout(d, 8))).toBe('5h 40%')
+  })
+
+  test('tones follow the level', async () => {
+    const tones = (x: ReturnType<typeof status>) => L.bandLayout(data(x), 160).map(s => s.tone)
+    expect(tones(status(46))).toContain('ok')
+    expect(tones(status(53))).toContain('warn')
+    const cap = L.bandLayout(data(status(56)), 160)
+    expect(cap[0]).toEqual({ text: '5h limit reached', tone: 'error' })
+    expect(text(cap)).toMatch(/^5h limit reached · new prompts & agents paused · resets in 4h 0m \(4:30\sPM\) · \/5h unlock to override$/)
+  })
+
+  test('idle, paused, unlocked and failing read in plain words', async () => {
+    expect(text(L.bandLayout(data(status(40), true), 160))).toBe('5h limit ready · starts with your next prompt · week 40%')
+    const off = status(40, {}, { offUntil: T0 + 5 * HOUR })
+    expect(text(L.bandLayout(data(off), 160))).toMatch(/^5h limit paused until 4:30\sPM \(in 4h 0m\) · week 40% · \/5h on to resume$/)
+    const un = status(60, {}, { unlockedBlock: T0 })
+    expect(text(L.bandLayout(data(un), 160))).toMatch(/133% used · unlocked · resets/)
+    const failing = L.evaluate({ cfg: cfg({ mode: 'weekly' }), now: at, block: L.startBlock(T0, cfg()), limits: undefined, tokens: 0, control: {} })
+    expect(text(L.bandLayout(L.bandData(failing, at, cfg({ mode: 'weekly' }), false, {}), 160))).toBe(
+      "⚠ 5h limit not active · can't read usage (no weekly window reported) · allowing work · /5h status",
+    )
+  })
+
+  test('a local estimate is marked with ≈', async () => {
+    const s = L.evaluate({ cfg: cfg(), now: at, block: L.startBlock(T0, cfg()), limits: undefined, tokens: 2_500_000, control: {} })
+    expect(text(L.bandLayout(L.bandData(s, at, cfg(), false, {}), 160))).toMatch(/ ≈25% used /)
   })
 })
 

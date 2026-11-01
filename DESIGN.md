@@ -97,15 +97,24 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 - `/5h bar on|off`: shortcut for the band.
 
 ## UI
-A one-line band above the prompt:
+A one-line band above the prompt, laid out for the width it has (`bandLayout`, pure). It uses the richest variant that fits:
 
 ```
-5h ███████░░░ 72% · resets 3:40 PM IST (2h 13m) · weekly-Δ 10.8/15% · wk 41%
+5h limit ━━━━━━━━──── 72% used · resets in 2h 13m (3:40 PM) · week 41%   (wide)
+5h limit ━━━━━━━─── 72% used · resets in 2h 13m · week 41%               (medium)
+5h ━━━━── 72% · 2h 13m left · wk 41%                                     (narrow)
+5h 72% · 2h 13m                                                           (tiny)
 ```
 
-- The colour is the default, yellow at `warn`, red at `cap`. The band is dim when `off` or `unlocked`, with a `⚠` prefix when degraded or failing open.
-- It is hidden when `showBar` is false, and it defers to the engine when `hasSurvey` is set.
-- It is refreshed by state writes, plus a 30 s timer for the countdown and other sessions' activity.
+- **Colours:** the label is bold, the empty track dim, and the % is green, then yellow at `warn`. At the cap the band switches to red text: `5h limit reached · new prompts & agents paused · resets in … · /5h unlock to override`.
+- **Wording per state:**
+  - idle: `5h limit ready · starts with your next prompt · week 56%`
+  - off: `paused until …`
+  - unlocked: ` · unlocked`
+  - failing: `⚠ 5h limit not active · can't read usage (…)`
+- **The measuring strategy is not shown in the band;** it's jargon. `/5h status` explains it in plain words. The band shows only `≈` when the % is a local token estimate.
+- **Countdown first, clock second.** The countdown is right whatever the machine's time zone is.
+- **Data:** the band reads `BandData` from a `$.state` atom tagged `shape: 'band-2'`. It is refreshed by state writes and a 30 s timer, and writes are skipped unless something visible at minute resolution changed.
 
 ## Security
 - No HTTP. No `$.session.authorize`. No credentials are read or stored.
