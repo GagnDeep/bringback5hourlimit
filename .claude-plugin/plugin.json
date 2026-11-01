@@ -1,6 +1,6 @@
 {
   "name": "bringback5hourlimit",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code (works on verified Ultra, Max, Pro, and offline).",
   "author": {
     "name": "GagnDeep"
@@ -72,8 +72,18 @@
     "showBar": {
       "type": "boolean",
       "title": "Live bar above the prompt",
-      "description": "Show the block %, reset time, strategy and weekly % above the prompt. Env: BB5H_SHOW_BAR.",
+      "description": "Show the live usage bar. /5h bar toggles it. Env: BB5H_SHOW_BAR.",
       "default": true
+    },
+    "barPosition": {
+      "type": "string",
+      "title": "Bar position",
+      "description": "below: at the end of the hint line under the input (takes no extra row). above: its own band above the input. /5h bar above|below switches. Env: BB5H_BAR_POSITION.",
+      "default": "below",
+      "options": [
+        "below",
+        "above"
+      ]
     },
     "timeZone": {
       "type": "string",

@@ -1,7 +1,8 @@
 // The real hooks module driven through the engine's test host.
+import type { On } from 'claude-code'
 import { type Engine, describe, expect, test } from 'claude-code/testing'
 
-import { HOUR, MIN, T0, cmd, iso, measureInput, prompt, spawnInput, turnDone, world } from './world'
+import { HOUR, MIN, T0, cmd, iso, measureInput, prompt, spawnInput, step, world } from './world'
 
 const ULTRA = (pct: number) => [{ kind: 'seven_day', percentUsed: pct, resetsAt: iso(T0 + 3 * 24 * HOUR) }]
 const MAX = (pct5: number) => [
@@ -60,6 +61,11 @@ describe('verified Ultra (weekly window only)', () => {
     await w.clock.advance(5 * HOUR)
     const after = await $.prompt.submit(prompt('new block'))
     expect(after.drop).toBe(undefined)
+    // The 5-hour-old reading is too old to anchor the new block...
+    expect(w.store.get('block')).toEqual(expect.objectContaining({ startedAt: T0 + 5 * HOUR }))
+    expect((w.store.get('block') as { weeklyBase?: number }).weeklyBase).toBe(undefined)
+    // ...the first fresh reading does.
+    await $.session.measure(measureInput(ULTRA(60)))
     expect(w.store.get('block')).toEqual(expect.objectContaining({ startedAt: T0 + 5 * HOUR, weeklyBase: 60 }))
   })
 
@@ -95,10 +101,10 @@ describe('no usage data (offline / API changed)', () => {
     const w = world(on, { env: { BB5H_TOKEN_BUDGET: '100000' } })
     await $.session.start(START)
     expect((await $.prompt.submit(prompt('a'))).drop).toBe(undefined)
-    await $.turn.complete(turnDone({ input_tokens: 50_000, output_tokens: 10_000 }))
-    await $.turn.complete(turnDone({ output_tokens: 30_000 }, 'agent-1'))
+    await step($, w, { input_tokens: 50_000, output_tokens: 10_000 })
+    await step($, w, { output_tokens: 30_000 }, 'agent-1')
     expect((await $.prompt.submit(prompt('b'))).drop).toBe(undefined)
-    await $.turn.complete(turnDone({ cache_read_input_tokens: 100_000 }))
+    await step($, w, { cache_read_input_tokens: 100_000 })
     const r = await $.prompt.submit(prompt('c'))
     expect(r.drop).toMatch(/100k of 100k tokens/)
     const status = await $.command.run(cmd('status'))
@@ -109,8 +115,58 @@ describe('no usage data (offline / API changed)', () => {
     const w = world(on, { rateLimits: ULTRA(10), env: { BB5H_MODE: 'tokens', BB5H_TOKEN_BUDGET: '1000' } })
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
-    await $.turn.complete(turnDone({ output_tokens: 1000 }))
+    await step($, w, { output_tokens: 1000 })
     expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/1k of 1k tokens/)
+  })
+})
+
+describe('detection', () => {
+  test('between whole weekly points the bar moves with tokens, marked ≈, and stays under the next point', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    await step($, w, { output_tokens: 1_000_000 }) // 0.25 of a point at the 4M prior
+    let s = (await $.command.run(cmd('status'))).text ?? ''
+    expect(s).toMatch(/^5h limit: ≈1% used/) // 0.25 of a point / 15
+    expect(s).toMatch(/used ≈0\.3% of your week \(0% reported \+ ≈0\.3% estimated from tokens/)
+    await step($, w, { output_tokens: 50_000_000 })
+    s = (await $.command.run(cmd('status'))).text ?? ''
+    expect(s).toMatch(/^5h limit: ≈6% used/) // capped at 0.95 of a point
+    expect(s).toMatch(/used ≈1% of your week/)
+  })
+
+  test('learns tokens per weekly point from tick to tick, never from the first partial tick', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    await step($, w, { output_tokens: 300_000 })
+    w.setLimits(ULTRA(41))
+    await $.session.measure(measureInput(ULTRA(41))) // first tick after baseline: partial, ignored
+    expect(w.store.get('calibration')).toBe(undefined)
+    await step($, w, { output_tokens: 2_000_000 })
+    w.setLimits(ULTRA(42))
+    await $.session.measure(measureInput(ULTRA(42))) // a whole point took 2M
+    expect(w.store.get('calibration')).toEqual({ tokensPerPct: 2_000_000, samples: 1 })
+    await step($, w, { output_tokens: 1_000_000 })
+    const s = (await $.command.run(cmd('status'))).text ?? ''
+    expect(s).toMatch(/2% reported \+ ≈0\.5% estimated/) // 1M at the learned 2M per point
+  })
+
+  test('an unchanged polled reading does not pass as fresh after a long idle', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    const at0 = (w.store.get('limits') as { at: number }).at
+    await w.clock.advance(6 * HOUR)
+    await $.command.run(cmd('status')) // polls $.session.usage(): same figures
+    expect((w.store.get('limits') as { at: number }).at).toBe(at0)
+    expect((await $.command.run(cmd('status'))).text).toMatch(/estimate/) // stale → token fallback
+  })
+
+  test('a weekly window past its reset time is not trusted', async ($, on) => {
+    const stale = [{ kind: 'seven_day', percentUsed: 90, resetsAt: iso(T0 - MIN) }]
+    world(on, { rateLimits: stale })
+    await $.session.start(START)
+    expect((await $.command.run(cmd('status'))).text).toMatch(/tokens counted on this machine/)
   })
 })
 
@@ -124,7 +180,7 @@ describe('two concurrent sessions share one block', () => {
     await $.session.start(START)
     expect((await $.prompt.submit(prompt('b1'))).drop).toBe(undefined)
     expect(w.store.get('block')).toEqual(expect.objectContaining({ startedAt: T0 - HOUR }))
-    await $.turn.complete(turnDone({ output_tokens: 100 }))
+    await step($, w, { output_tokens: 100 })
     expect(w.store.get('tok:sess-B')).toEqual(expect.objectContaining({ blockStart: T0 - HOUR, tokens: 100 }))
     expect((await $.prompt.submit(prompt('b2'))).drop).toMatch(/1k of 1k tokens/)
   })
@@ -165,6 +221,7 @@ describe('/5h commands', () => {
     expect((await $.agent.spawn(spawnInput())).deny).toBe(undefined)
     await w.clock.advance(5 * HOUR)
     await $.prompt.submit(prompt('new block'))
+    await $.session.measure(measureInput(ULTRA(60)))
     w.setLimits(ULTRA(80))
     await $.session.measure(measureInput(ULTRA(80)))
     expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
@@ -190,28 +247,68 @@ describe('/5h commands', () => {
     expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
   })
 
-  test('bar off hides the band; bar on shows it', async ($, on) => {
-    world(on, { rateLimits: ULTRA(40) })
-    // Stands for the engine's own (empty) band beneath the plugin.
+  const ENGINE_DRAWS = (on: On) =>
+    // Stands for the engine's own drawing beneath the plugin.
     on('ui.render', ($, e) => {
       const { Text } = $.ui.resolve(e)
-      return <Text>engine</Text>
+      const p = e.props as { hint?: string; tail?: string }
+      return <Text>{p.hint !== undefined ? `${p.hint}${p.tail ? ` ${p.tail}` : ''}` : 'engine'}</Text>
     })
+  const HINT = { plugin: 'bringback5hourlimit', component: 'PromptHint', requestId: 'hint', surface: 'terminal', viewport: { columns: 140, rows: 40 }, props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } } as never
+  const BAND = { plugin: 'bringback5hourlimit', component: 'AbovePrompt', requestId: 'above', surface: 'terminal', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 140, scroll: { offset: 0, bodyRows: 3 }, view: {} } } as never
+
+  test('default placement: the bar rides on the hint line under the input', async ($, on) => {
+    world(on, { rateLimits: ULTRA(40) })
+    ENGINE_DRAWS(on)
     await $.session.start(START)
     await $.prompt.submit(prompt('a'))
-    const band = { plugin: 'bringback5hourlimit', component: 'AbovePrompt', requestId: 'above', surface: 'terminal', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 140, scroll: { offset: 0, bodyRows: 3 } } } as never
-    let ui = await $.ui.mount(band)
-    expect((await ui.find({ type: 'Text', text: /0% used/ }))?.text).toBe(' 0% used')
-    expect((await ui.find({ type: 'Text', text: /week 40%/ }))?.text).toBe(' · week 40%')
-    await ui.unmount()
-    await $.command.run(cmd('bar off'))
-    ui = await $.ui.mount(band)
-    expect(await ui.find({ type: 'Text', text: /5h/ })).toBe(undefined)
-    await ui.unmount()
-    await $.command.run(cmd('bar on'))
-    ui = await $.ui.mount(band)
-    expect(await ui.find({ type: 'Text', text: /5h/ })).toBeDefined()
-    await ui.unmount()
+    const hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toMatch(/^\? for shortcuts 5h limit ░{10} 0% used · resets in 5h 0m \(.+\) · week 40%$/)
+    await hint.unmount()
+    const band = await $.ui.mount(BAND)
+    expect((await band.find({ type: 'Text' }))?.text).toBe('engine')
+    await band.unmount()
+  })
+
+  test('/5h bar toggles; /5h bar above moves it above the input, /5h bar below back', async ($, on) => {
+    world(on, { rateLimits: ULTRA(40) })
+    ENGINE_DRAWS(on)
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    expect((await $.command.run(cmd('bar'))).text).toMatch(/Bar hidden/)
+    let hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+    await hint.unmount()
+    expect((await $.command.run(cmd('bar'))).text).toMatch(/Bar on \(below the prompt\)/)
+    await $.command.run(cmd('bar above'))
+    const band = await $.ui.mount(BAND)
+    expect((await band.find({ type: 'Text', text: /0% used/ }))?.text).toBe(' 0% used')
+    expect((await band.find({ type: 'Text', text: /week 40%/ }))?.text).toBe(' · week 40%')
+    await band.unmount()
+    hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+    await hint.unmount()
+    await $.command.run(cmd('bar below'))
+    hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toMatch(/^\? for shortcuts 5h limit/)
+    await hint.unmount()
+  })
+
+  test('near and at the limit the hint-line bar carries ⚠ and ⛔', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    ENGINE_DRAWS(on)
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    w.setLimits(ULTRA(53))
+    await $.session.measure(measureInput(ULTRA(53)))
+    let hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toMatch(/shortcuts ⚠ 5h limit █{9}░ 86% used/)
+    await hint.unmount()
+    w.setLimits(ULTRA(56))
+    await $.session.measure(measureInput(ULTRA(56)))
+    hint = await $.ui.mount(HINT)
+    expect((await hint.find({ type: 'Text' }))?.text).toMatch(/shortcuts ⛔ 5h limit reached/)
+    await hint.unmount()
   })
 
   test('unknown input prints usage', async ($, on) => {

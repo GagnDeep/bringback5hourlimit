@@ -1,7 +1,7 @@
 // Stands in for Claude Code beneath the mod: store, clock, env, usage, UI.
 // Two "sessions" can share one store Map to test cross-session behaviour.
 import type { On } from 'claude-code'
-import { type MockClock, type MockSession, mock } from 'claude-code/testing'
+import { type Engine, type MockClock, type MockSession, mock } from 'claude-code/testing'
 
 export const HOUR = 3_600_000
 export const MIN = 60_000
@@ -28,6 +28,8 @@ export type World = {
   toasts: string[]
   notifications: string[]
   spawned: string[]
+  /** Usage the next model request reports. */
+  nextUsage: Record<string, number> | undefined
   setLimits(list: RateLimit[] | 'throw'): void
   /** Every later `$.store.get` throws, as with a corrupt or locked store. */
   breakStore(): void
@@ -47,6 +49,7 @@ export function world(on: On, o: WorldOptions = {}): World {
     toasts: [],
     notifications: [],
     spawned: [],
+    nextUsage: undefined,
     setLimits(list) {
       limits = list
     },
@@ -86,6 +89,13 @@ export function world(on: On, o: WorldOptions = {}): World {
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  on('turn.step', async function* ($, e) {
+    const usage = w.nextUsage
+      ? { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...w.nextUsage, model: 'claude-test' }
+      : null
+    w.nextUsage = undefined
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
+  })
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('agent.spawn', ($, e) => {
     w.spawned.push(e.subagentType)
@@ -110,6 +120,14 @@ export function spawnInput(type = 'general-purpose') {
     provider: { plugin: 'engine', tier: 'core' },
     parentModel: 'claude-test',
   } as never
+}
+
+/** One model request reporting `usage`, as the engine streams it. */
+export async function step($: Engine, w: World, usage: Record<string, number>, agentId?: string): Promise<void> {
+  w.nextUsage = usage
+  const stream = $.turn.step({ turnId: 't', index: 0, model: 'claude-test', messageCount: 1, ...(agentId ? { agentId } : {}) } as never)
+  let r = await stream.next()
+  while (r.done !== true) r = await stream.next()
 }
 
 export function turnDone(usage: Record<string, number> | undefined, agentId?: string) {

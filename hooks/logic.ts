@@ -7,6 +7,7 @@ import type { BandData } from '../types'
 export type Mode = 'auto' | 'official' | 'weekly' | 'tokens'
 export type Strategy = 'official' | 'weekly' | 'tokens'
 export type FailMode = 'open' | 'closed'
+export type BarPosition = 'below' | 'above'
 
 export type Config = {
   windowHours: number
@@ -17,6 +18,7 @@ export type Config = {
   warnPct: number
   failMode: FailMode
   showBar: boolean
+  barPosition: BarPosition
   timeZone: string
 }
 
@@ -29,8 +31,15 @@ export const DEFAULTS: Config = {
   warnPct: 80,
   failMode: 'open',
   showBar: true,
+  barPosition: 'below',
   timeZone: '',
 }
+
+/**
+ * Prior for how many weighted tokens make one point of the weekly limit,
+ * used until the mod has watched the weekly % tick up once and learned it.
+ */
+export const DEFAULT_TOKENS_PER_WEEKLY_PCT = 4_000_000
 
 const HOUR = 3_600_000
 
@@ -40,6 +49,7 @@ type Raw = Record<string, unknown>
 
 const MODES: readonly Mode[] = ['auto', 'official', 'weekly', 'tokens']
 const FAILS: readonly FailMode[] = ['open', 'closed']
+const POSITIONS: readonly BarPosition[] = ['below', 'above']
 
 function num(v: unknown, min: number, max: number): number | undefined {
   if (v === undefined || v === null || v === '') return undefined
@@ -94,6 +104,7 @@ export function parseLayer(raw: Raw): { values: Partial<Config>; invalid: string
   take('warnPct', num(raw.warnPct, 1, 100))
   take('failMode', oneOf(raw.failMode, FAILS))
   take('showBar', bool(raw.showBar))
+  take('barPosition', oneOf(raw.barPosition, POSITIONS))
   take('timeZone', zone(raw.timeZone))
   return { values, invalid }
 }
@@ -147,12 +158,33 @@ export function isFresh(limits: Limits | undefined, now: number, cfg: Config): l
   return !!limits && now - limits.at <= Math.max(cfg.windowHours, 5) * HOUR && limits.at <= now + 60_000
 }
 
+/** A reading young enough to anchor a new block's weekly baseline. */
+export const BASELINE_MAX_AGE_MS = 15 * 60_000
+
+/**
+ * The windows that can be trusted now: a fresh snapshot, less any window
+ * whose reset time has passed (its percentage belongs to the old window).
+ */
+export function liveLimits(limits: Limits | undefined, now: number, cfg: Config): Limits | undefined {
+  if (!isFresh(limits, now, cfg)) return undefined
+  const out: Limits = { at: limits.at }
+  if (limits.fiveHour && !(limits.fiveHour.resetsAt !== undefined && limits.fiveHour.resetsAt <= now)) out.fiveHour = limits.fiveHour
+  if (limits.sevenDay && !(limits.sevenDay.resetsAt !== undefined && limits.sevenDay.resetsAt <= now)) out.sevenDay = limits.sevenDay
+  return out.fiveHour || out.sevenDay ? out : undefined
+}
+
+/** Same windows and figures, whenever taken. */
+export function sameLimits(a: Limits | undefined, b: Limits | undefined): boolean {
+  const strip = (l: Limits | undefined) => (l ? JSON.stringify({ f: l.fiveHour ?? null, s: l.sevenDay ?? null }) : '')
+  return strip(a) === strip(b)
+}
+
 // ---------------------------------------------------------------- strategy
 
 export type Selection = { strategy: Strategy; available: boolean; degraded: boolean; reason?: string }
 
 export function selectStrategy(cfg: Config, limits: Limits | undefined, now: number): Selection {
-  const fresh = isFresh(limits, now, cfg) ? limits : undefined
+  const fresh = liveLimits(limits, now, cfg)
   const has5 = !!fresh?.fiveHour
   const has7 = !!fresh?.sevenDay
   switch (cfg.mode) {
@@ -181,6 +213,13 @@ export type Block = {
   weeklyBase?: number
   weeklyLast?: number
   weeklyCarried: number
+  /** Block token total when the weekly % last ticked up (or the baseline was set). */
+  stepTokens?: number
+  /**
+   * True once `stepTokens` was taken at a tick. A baseline lands somewhere
+   * inside a weekly point, so the first rise after it is no clean sample.
+   */
+  stepExact?: boolean
 }
 
 export function isActive(block: Block | undefined, now: number): block is Block {
@@ -199,7 +238,8 @@ export function startBlock(now: number, cfg: Config, weeklyPct?: number): Block 
 /** The active block, or a new one started now. */
 export function ensureBlock(block: Block | undefined, now: number, cfg: Config, limits?: Limits): Block {
   if (isActive(block, now)) return block
-  const weekly = isFresh(limits, now, cfg) ? limits.sevenDay?.pct : undefined
+  const live = liveLimits(limits, now, cfg)
+  const weekly = live && now - live.at <= BASELINE_MAX_AGE_MS ? live.sevenDay?.pct : undefined
   return startBlock(now, cfg, weekly)
 }
 
@@ -220,26 +260,56 @@ export function mergeBlock(a: Block | undefined, b: Block | undefined, now: numb
     endsAt: Math.min(A.endsAt, B.endsAt),
     weeklyCarried: Math.max(A.weeklyCarried, B.weeklyCarried),
   }
+  const later = (A.stepTokens ?? -1) >= (B.stepTokens ?? -1) ? A : B
+  if (later.stepTokens !== undefined) out.stepTokens = later.stepTokens
+  if (later.stepExact) out.stepExact = true
   if (base.length) out.weeklyBase = Math.min(...base)
   if (last.length) out.weeklyLast = A.weeklyCarried === B.weeklyCarried ? Math.max(...last) : (A.weeklyCarried > B.weeklyCarried ? A : B).weeklyLast
   return out
 }
 
-/** Folds a weekly reading into the block (baseline, growth, weekly reset). */
-export function observeWeekly(block: Block, pct: number): Block {
+/** Tokens spent over a rise of the weekly %, to learn their ratio. */
+export type CalibrationSample = { tokens: number; pct: number }
+
+/**
+ * Folds a weekly reading into the block (baseline, growth, weekly reset).
+ * `tokensNow` is the block's token total, so a rise yields a sample of how
+ * many tokens one weekly point took.
+ */
+export function observeWeekly(block: Block, pct: number, tokensNow = 0): { block: Block; sample?: CalibrationSample } {
   if (block.weeklyBase === undefined || block.weeklyLast === undefined) {
-    return { ...block, weeklyBase: pct, weeklyLast: pct }
+    return { block: { ...block, weeklyBase: pct, weeklyLast: pct, stepTokens: tokensNow, stepExact: false } }
   }
   if (pct < block.weeklyLast - 0.5) {
     // The weekly window reset inside this block: carry what was spent.
     return {
-      ...block,
-      weeklyCarried: block.weeklyCarried + Math.max(0, block.weeklyLast - block.weeklyBase),
-      weeklyBase: 0,
-      weeklyLast: pct,
+      block: {
+        ...block,
+        weeklyCarried: block.weeklyCarried + Math.max(0, block.weeklyLast - block.weeklyBase),
+        weeklyBase: 0,
+        weeklyLast: pct,
+        stepTokens: tokensNow,
+        stepExact: false,
+      },
     }
   }
-  return { ...block, weeklyLast: Math.max(block.weeklyLast, pct) }
+  if (pct > block.weeklyLast) {
+    const rise = pct - block.weeklyLast
+    const tokens = tokensNow - (block.stepTokens ?? 0)
+    const next = { ...block, weeklyLast: pct, stepTokens: tokensNow, stepExact: true }
+    return block.stepExact && tokens > 0 ? { block: next, sample: { tokens, pct: rise } } : { block: next }
+  }
+  return { block }
+}
+
+export type Calibration = { tokensPerPct: number; samples: number }
+
+/** Learns tokens-per-weekly-point from a sample (a moving average). */
+export function calibrate(prev: Calibration | undefined, sample: CalibrationSample): Calibration | undefined {
+  if (sample.pct <= 0 || sample.tokens < 10_000) return prev
+  const r = Math.min(1e10, Math.max(1e4, sample.tokens / sample.pct))
+  if (!prev) return { tokensPerPct: Math.round(r), samples: 1 }
+  return { tokensPerPct: Math.round(prev.tokensPerPct * 0.6 + r * 0.4), samples: prev.samples + 1 }
 }
 
 export function weeklySpent(block: Block): number {
@@ -292,6 +362,8 @@ export type Status = {
   resetsAt: number
   weeklyPct?: number
   weeklyResetsAt?: number
+  /** Part of `used` estimated from tokens since the weekly % last ticked (weekly). */
+  estimated: number
   windowLabel: string
   /** True when the cap applies to new work now. */
   blocks: boolean
@@ -304,12 +376,14 @@ export type EvalInput = {
   limits: Limits | undefined
   tokens: number
   control: Control
+  calibration?: Calibration
 }
 
 export function evaluate(x: EvalInput): Status {
-  const { cfg, now, block, limits, tokens, control } = x
+  const { cfg, now, block, limits, tokens, control, calibration } = x
+  let estimated = 0
   const sel = selectStrategy(cfg, limits, now)
-  const fresh = isFresh(limits, now, cfg) ? limits : undefined
+  const fresh = liveLimits(limits, now, cfg)
   const weeklyPct = fresh?.sevenDay?.pct
   const weeklyResetsAt = fresh?.sevenDay?.resetsAt
   let used: number
@@ -320,7 +394,7 @@ export function evaluate(x: EvalInput): Status {
   if (!sel.available) {
     return {
       strategy: sel.strategy, degraded: true, reason: sel.reason, level: 'failing', pct: 0, used: 0,
-      budget: 0, resetsAt, weeklyPct, weeklyResetsAt, windowLabel, blocks: cfg.failMode === 'closed',
+      budget: 0, resetsAt, weeklyPct, weeklyResetsAt, estimated, windowLabel, blocks: cfg.failMode === 'closed',
     }
   }
   if (sel.strategy === 'official' && fresh?.fiveHour) {
@@ -331,7 +405,12 @@ export function evaluate(x: EvalInput): Status {
     resetsAt = !expired && w.resetsAt !== undefined ? w.resetsAt : block.endsAt
     windowLabel = '5h'
   } else if (sel.strategy === 'weekly') {
-    used = weeklySpent(block)
+    // Anthropic reports whole weekly points. Between ticks, estimate from
+    // tokens, kept under the next point so it never runs a point ahead.
+    const ratio = calibration?.tokensPerPct ?? DEFAULT_TOKENS_PER_WEEKLY_PCT
+    const since = Math.max(0, tokens - (block.stepTokens ?? 0))
+    estimated = block.weeklyBase === undefined ? 0 : Math.min(0.95, since / ratio)
+    used = weeklySpent(block) + estimated
     budget = cfg.weeklyBudgetPct
   } else {
     used = tokens
@@ -343,7 +422,7 @@ export function evaluate(x: EvalInput): Status {
   else if (control.unlockedBlock !== undefined && control.unlockedBlock === block.startedAt) level = 'unlocked'
   return {
     strategy: sel.strategy, degraded: sel.degraded, reason: sel.reason, level, pct, used, budget,
-    resetsAt, weeklyPct, weeklyResetsAt, windowLabel, blocks: level === 'cap',
+    resetsAt, weeklyPct, weeklyResetsAt, estimated, windowLabel, blocks: level === 'cap',
   }
 }
 
@@ -444,7 +523,8 @@ export type Segment = { text: string; tone: Tone }
 export function bandData(s: Status, now: number, cfg: Config, idle: boolean, control: Control): BandData {
   const d: BandData = {
     level: s.level, pct: s.pct, resetsAt: s.resetsAt, now, idle: idle && s.strategy !== 'official',
-    isEstimate: s.strategy === 'tokens' && s.degraded, windowLabel: s.windowLabel,
+    isEstimate: (s.strategy === 'tokens' && s.degraded) || (s.strategy === 'weekly' && s.estimated > 0.001),
+    windowLabel: s.windowLabel,
     failMode: cfg.failMode, timeZone: cfg.timeZone,
   }
   if (s.weeklyPct !== undefined) d.weeklyPct = s.weeklyPct
@@ -532,6 +612,37 @@ export function bandLayout(d: BandData, columns: number): Segment[] {
   return [{ text: last.map(s => s.text).join('').slice(0, Math.max(0, columns)), tone: last[0]!.tone }]
 }
 
+/** Cells the footer's mode labels take, with the space after them. */
+export function modesWidth(modes: readonly string[]): number {
+  const text = modes.join(' ')
+  return text ? [...text].length + 1 : 0
+}
+
+/**
+ * Cells left for the bar on the hint row: the row less its 2-cell indent,
+ * the mode indicator, the engine's hint, another plugin's tail, the
+ * engine's " · " before a tail, and one cell spare so it is never cut.
+ */
+export function hintRoom(columns: number, modes: number, hint: string, tail?: string): number {
+  // The permission-mode indicator (`⏵⏵ auto mode on`) shares the row but is
+  // not reported to mods; it shows whenever the hint offers shift+tab, so
+  // room is kept for the longest one (`⏵⏵ bypass permissions on `).
+  const indicator = /shift\+tab/i.test(hint) ? 26 : 0
+  const used = 2 + Math.max(modes, indicator) + [...hint].length + (tail ? [...tail].length + 3 : 0) + 3 + 1
+  return columns - used
+}
+
+/**
+ * The bar as plain text for the hint line under the prompt, which is drawn
+ * dim: ⚠ and ⛔ carry what colour would. Empty when under 7 cells fit.
+ */
+export function hintTail(d: BandData, columns: number): string {
+  if (columns < 7) return ''
+  const mark = d.level === 'cap' ? '⛔ ' : d.level === 'warn' || d.level === 'failing' ? '⚠ ' : ''
+  const body = bandText(d, columns - [...mark].length)
+  return d.level === 'failing' ? body : mark + body
+}
+
 /** One line of plain text, for command output. */
 export function bandText(d: BandData, columns = 120): string {
   return bandLayout(d, columns).map(s => s.text).join('')
@@ -565,6 +676,7 @@ export type Command =
   | { kind: 'on' }
   | { kind: 'unlock' }
   | { kind: 'reset' }
+  | { kind: 'toggleBar' }
   | { kind: 'set'; key: keyof Config; value: string }
   | { kind: 'error'; message: string }
 
@@ -577,11 +689,12 @@ export const SET_KEYS: Record<string, keyof Config> = {
   mode: 'mode',
   fail: 'failMode', failmode: 'failMode',
   bar: 'showBar', showbar: 'showBar',
+  position: 'barPosition', barposition: 'barPosition',
   tz: 'timeZone', timezone: 'timeZone',
 }
 
 export const USAGE =
-  'Usage: /5h [status|on|off|unlock|reset] · /5h set <hours|budget|tokens|cap|warn|mode|fail|bar|tz> <value> · /5h set <number> · /5h bar on|off'
+  'Usage: /5h [status|on|off|unlock|reset] · /5h bar (toggle) · /5h bar above|below · /5h set <hours|budget|tokens|cap|warn|mode|fail|tz> <value> · /5h set <number>'
 
 /** The budget key the active strategy reads, for `/5h set <number>`. */
 export function budgetKeyFor(s: Strategy): keyof Config {
@@ -595,6 +708,8 @@ export function parseCommand(args: string, active: Strategy): Command {
     case 'status': case 'off': case 'on': case 'unlock': case 'reset':
       return rest.length ? { kind: 'error', message: USAGE } : { kind: verb }
     case 'bar':
+      if (rest.length === 0) return { kind: 'toggleBar' }
+      if (rest.length === 1 && (rest[0] === 'above' || rest[0] === 'below')) return { kind: 'set', key: 'barPosition', value: rest[0] }
       return rest.length === 1 ? { kind: 'set', key: 'showBar', value: rest[0]! } : { kind: 'error', message: USAGE }
     case 'set': {
       if (rest.length === 1 && /^[\d._]+[km]?$/i.test(rest[0]!)) {
@@ -629,12 +744,13 @@ export function applySet(overrides: Raw, key: keyof Config, value: string): { ov
 export function statusText(s: Status, cfg: Config, now: number, block: Block, control: Control, invalid: string[], idle = false): string {
   const tz = cfg.timeZone
   const W = s.windowLabel
+  const pctText = `${s.estimated > 0.001 || (s.strategy === 'tokens' && s.degraded) ? '≈' : ''}${Math.floor(s.pct)}%`
   const headline: Record<Level, string> = {
-    ok: `${Math.floor(s.pct)}% used`,
-    warn: `${Math.floor(s.pct)}% used, close to the limit`,
+    ok: `${pctText} used`,
+    warn: `${pctText} used, close to the limit`,
     cap: 'limit reached: new prompts and agents are paused',
     off: 'paused (not enforcing)',
-    unlocked: `unlocked for this block (${Math.floor(s.pct)}% used)`,
+    unlocked: `unlocked for this block (${pctText} used)`,
     failing: cfg.failMode === 'closed' ? "can't read usage: new prompts are paused" : "can't read usage: not enforcing",
   }
   const lines = [`${W} limit: ${idle && s.level === 'ok' && s.strategy !== 'official' ? 'ready (no block running)' : headline[s.level]}`]
@@ -644,7 +760,13 @@ export function statusText(s: Status, cfg: Config, now: number, block: Block, co
     lines.push(`  Why: ${s.reason ?? 'no usage data'}. Fix: /5h set mode auto (falls back to counting tokens).`)
   } else if (s.strategy === 'weekly') {
     lines.push(`  Measured as: a share of your weekly limit. Each ${W} block may use ${trimNum(cfg.weeklyBudgetPct)}% of your week;`)
-    lines.push(`    this block has used ${round1(s.used)}%. Change: /5h set budget <percent>`)
+    lines.push(
+      s.estimated > 0.001
+        ? `    this block has used ≈${round1(s.used)}% of your week (${round1(s.used - s.estimated)}% reported + ≈${round1(s.estimated)}% estimated from tokens,`
+        : `    this block has used ${round1(s.used)}% of your week.`,
+    )
+    if (s.estimated > 0.001) lines.push('    since Anthropic reports whole weekly points). Change: /5h set budget <percent>')
+    else lines.push('    Change: /5h set budget <percent>')
   } else if (s.strategy === 'official') {
     lines.push(`  Measured as: Anthropic's own 5-hour limit, paused at ${trimNum(cfg.officialCapPct)}% of it (now ${round1(s.used)}%).`)
     lines.push('    Change: /5h set cap <percent>')
@@ -658,7 +780,7 @@ export function statusText(s: Status, cfg: Config, now: number, block: Block, co
   if (control.offUntil !== undefined && now < control.offUntil) lines.push(`  Paused until ${formatClock(control.offUntil, tz, now)}. /5h on to resume.`)
   if (s.level === 'unlocked') lines.push('  /5h on re-locks it now.')
   lines.push(`  Settings: ${trimNum(cfg.windowHours)}h blocks · warn at ${trimNum(cfg.warnPct)}% · mode ${cfg.mode} · ` +
-    `if usage can't be read: ${cfg.failMode === 'open' ? 'allow' : 'refuse'} · bar ${cfg.showBar ? 'on' : 'off'}`)
+    `if usage can't be read: ${cfg.failMode === 'open' ? 'allow' : 'refuse'} · bar ${cfg.showBar ? cfg.barPosition + ' the prompt' : 'off'} (/5h bar toggles)`)
   lines.push(tz ? `  Times in ${tz}.` : `  Times in ${systemZone()} (system). Yours differs? /5h set tz Asia/Kolkata`)
   if (invalid.length) lines.push(`  Ignored invalid settings: ${[...new Set(invalid)].join(', ')}`)
   return lines.join('\n')

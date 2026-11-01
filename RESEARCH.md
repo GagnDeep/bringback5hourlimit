@@ -42,6 +42,9 @@ Researched 2026-11-01 against **Claude Code 2.1.316** (`claude --version`; ≥ 2
 - `Intl.DateTimeFormat` with `timeZone: 'Asia/Calcutta'` works inside the hooks environment (epoch formatted as `5:30 AM`).
 - `{ drop }` from `prompt.submit` works in `claude -p` (stderr: `Prompt dropped by a hook: <reason>`).
 
+- **Whole points.** In practice `seven_day.percentUsed` arrives as a whole number (56, never 56.3) on this account, even though D allows one decimal. Over a 1.5 h session it stayed at 56, so per-point resolution alone left the bar stuck at 0 %. This is why the mod estimates between ticks from tokens.
+- **The hint row.** `PromptHint`'s `e.props.hint` holds only the engine's hint text (`(shift+tab to cycle)`). The permission-mode indicator on the same row (`⏵⏵ auto mode on`) is not in it, and `SessionMode`'s `modes` was `[]`. The mod reserves room for the indicator so the tail is never cut.
+
 ## 3. Existing mods studied
 
 **usage-quota** (anantraghunath/claude-code-usage-quota-mod, **MIT**)

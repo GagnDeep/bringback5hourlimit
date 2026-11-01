@@ -50,6 +50,15 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 
 `mode` lets the person budget by tokens instead of percent (`mode=tokens`), and `windowHours` changes the block length (e.g. a 3 h or 8 h block).
 
+### Detection details
+- **Whole points.** Anthropic reports `percentUsed` in whole points in practice. Between ticks, the weekly spend gets `+ min(0.95, tokensSinceTick / tokensPerPct)`.
+  - `tokensPerPct` is learned (moving average, stored as `calibration`) from tick-to-tick intervals only (`stepExact`), never from the partial first tick after a baseline.
+  - The default prior is 4M weighted tokens per point.
+- **Per request.** Tokens are counted at `turn.step` (each model request), not at `turn.complete`.
+- **Freshness.** A `session.measure` reading is always fresh. A polled `$.session.usage()` reading is stored only when its figures differ from what's stored.
+- **Baselines.** A new block's baseline comes only from a reading under 15 minutes old (`BASELINE_MAX_AGE_MS`).
+- **Expired windows.** A window whose `resetsAt` has passed is dropped (`liveLimits`).
+
 ## Blocks
 - A block starts on the first activity after the previous block expired. Activity is a prompt that will run, an agent spawn, or a turn completing with usage. A block lasts `windowHours`.
 - Shared record `block` in `$.store`: `{ startedAt, endsAt, weeklyBase?, weeklyLast?, weeklyCarried }`.
@@ -97,7 +106,14 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 - `/5h bar on|off`: shortcut for the band.
 
 ## UI
-A one-line band above the prompt, laid out for the width it has (`bandLayout`, pure). It uses the richest variant that fits:
+Two placements (`barPosition`, `/5h bar above|below`; `/5h bar` toggles):
+- **below** (default): `PromptHint`'s `tail`, at the end of the dim hint line under the input.
+  - It takes no row, and the engine's line and pills stay live.
+  - The room for it is the row less the indent, the engine's mode indicator (not reported to mods; 26 cells are reserved whenever the hint offers shift+tab), the hint, any other tail and the separator.
+  - The tail is drawn dim, so `⚠` / `⛔` mark warn and cap.
+- **above**: the `AbovePrompt` band with `marginTop={1}`, so there's one blank row above and the engine's one blank row below.
+
+The band itself is a one-line band laid out for the width it has (`bandLayout`, pure). It uses the richest variant that fits:
 
 ```
 5h limit ███████░░░ 72% used · resets in 2h 13m (3:40 PM) · week 41%   (wide)

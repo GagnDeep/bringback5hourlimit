@@ -8,6 +8,8 @@ When your 5-hour budget runs out, new prompts and new subagents are refused unti
 5h limit ███████░░░ 72% used · resets in 2h 13m (3:40 PM) · week 41%
 ```
 
+By default the bar sits **below the input**, at the end of the hint line, so it takes no extra row. Prefer a band of its own **above the input**? Run `/5h bar above`. `/5h bar` toggles it on and off.
+
 The bar fits the space it has. On a narrow terminal it shrinks to `5h ████░░ 72% · 2h 13m left · wk 41%`, then to `5h 72% · 2h 13m`. It's a quiet grey normally, yellow near the limit, red once the limit is reached (`5h limit reached · new prompts & agents paused · resets in 1h 2m`), and `≈` marks a local estimate.
 
 ## Install
@@ -37,7 +39,8 @@ It works with the defaults, so there's nothing to set up. You'll need Claude Cod
 | `/5h unlock` | One-time override. It lifts the cap for the rest of this block only. |
 | `/5h set <key> <value>` | Changes a setting. Keys: `hours`, `budget`, `tokens`, `cap`, `warn`, `mode`, `fail`, `bar`, `tz`. |
 | `/5h set <number>` | Sets the budget for the strategy that's active now, e.g. `/5h set 20` or `/5h set 5m`. |
-| `/5h bar on` / `/5h bar off` | Shows or hides the live bar above the prompt. |
+| `/5h bar` | Toggles the live bar on and off. |
+| `/5h bar below` / `/5h bar above` | Puts the bar under the input (default; no extra row) or in its own band above it. |
 | `/5h reset` | Clears every `/5h set` override. |
 
 `/5h` always works, even when you're capped.
@@ -59,7 +62,8 @@ Settings are read in this order, and the first one found wins:
 | `tokenBudget` | `BB5H_TOKEN_BUDGET` | `10000000` | Tokens allowed per block in `tokens` mode, counted across all sessions. |
 | `warnPct` | `BB5H_WARN_PCT` | `80` | Warns you at this % of the block budget. |
 | `failMode` | `BB5H_FAIL_MODE` | `open` | What happens if usage can't be measured. `open` allows work and shows a warning. `closed` refuses new work. |
-| `showBar` | `BB5H_SHOW_BAR` | `true` | Shows the live bar above the prompt. |
+| `showBar` | `BB5H_SHOW_BAR` | `true` | Shows the live usage bar. |
+| `barPosition` | `BB5H_BAR_POSITION` | `below` | `below`: on the hint line under the input. `above`: its own band above the input. |
 | `timeZone` | `BB5H_TIMEZONE` | system | Time zone for reset times, e.g. `Asia/Kolkata`. |
 
 ## How usage is measured
@@ -67,8 +71,17 @@ Settings are read in this order, and the first one found wins:
 In `auto` mode the mod uses the first of these that's available:
 
 1. **Anthropic's 5-hour window (`official`).** This applies to Max, Pro and unverified Ultra accounts. If Anthropic still reports a 5-hour %, the cap is `officialCapPct` of it, and the reset time is Anthropic's.
-2. **Weekly-% delta (`weekly`).** This applies to verified Ultra accounts, which only report a weekly window. When a block starts, the mod records your weekly %. What the block has spent is how much your weekly % has risen since then. When that rise reaches `weeklyBudgetPct`, you're capped. This uses Anthropic's own units, and it handles the weekly reset happening partway through a block.
-3. **Local token count (`tokens`).** This is used when there's no usage data, e.g. offline, on API keys, or if the API changes. The mod counts tokens from every turn and subagent on this machine. Cache reads count at 10%.
+2. **Share of your week (`weekly`).** This applies to verified Ultra accounts, which only report a weekly window. When a block starts, the mod records your weekly %. What the block has spent is how much your weekly % has risen since then. When that rise reaches `weeklyBudgetPct`, you're capped. This uses Anthropic's own units, and it handles the weekly reset happening partway through a block.
+   - Anthropic reports the weekly % in **whole points**, so between ticks the mod estimates progress from tokens, shown with `≈`.
+   - It learns how many tokens one weekly point takes by watching ticks. It never learns from the first tick after a block starts, because that one is partial.
+   - The estimate always stays under the next real point, so it can't run ahead of Anthropic's number by more than one point.
+3. **Local token count (`tokens`).** This is used when there's no usage data, e.g. offline, on API keys, or if the API changes. The mod counts tokens from every model request, subagents included, on this machine. Cache reads count at 10%.
+
+**How it keeps the numbers honest:**
+- Tokens are counted on every model request, so the bar moves during long turns.
+- A reading only counts as fresh when Anthropic actually sends one. Re-reading the last response's figures doesn't make old numbers look current.
+- A new block takes its baseline only from a reading under 15 minutes old. Otherwise it waits for the next real reading, so usage from before the block (another machine, claude.ai) isn't charged to it.
+- A window whose reset time has passed is ignored rather than trusted.
 
 You can also force one of these with `mode`. For example, `/5h set mode tokens` budgets by tokens instead of by percent.
 
@@ -84,7 +97,8 @@ You can also force one of these with `mode`. For example, `/5h set mode tokens` 
 - **This is local only.** The mod can't change Anthropic's limits, and it doesn't try to. It only refuses work on your own machine.
 - **The weekly-% budget is an estimate.** Anthropic never published the old ratio between the 5-hour and weekly limits, so the default of 15% of weekly is a judgement call. Change it if it doesn't suit you.
 - **It relies on the Claude Code mods API**, which is early access and may change. If the usage data disappears, the mod falls back to counting tokens and says so in the bar.
-- **The weekly % only updates when Anthropic reports it**, which happens with each response. Very small budgets (under 3%) will be coarse.
+- **The weekly % only updates when Anthropic reports it**, in whole points, with each response. Between points the bar is an estimate (`≈`) until the mod has learned your token-to-point ratio.
+- **Across machines** only the weekly % is shared, because it's account-wide. The block timer, `/5h off` and `/5h unlock` are per machine.
 - When you hit Anthropic's **real** limit, Claude Code's own wait-and-resume (since v2.1.234) takes over. The mod doesn't interfere with it.
 
 ## Privacy and security
@@ -99,7 +113,7 @@ You can also force one of these with `mode`. For example, `/5h set mode tokens` 
 Claude Code **2.1.316**, on Linux, with a live account that reports only a weekly window. The checks that passed:
 - `tsc`
 - `claude plugin validate`
-- 56 tests run with `claude plugin test`
+- 70 tests run with `claude plugin test`
 - A live smoke test: refused at a tiny budget, then `/5h unlock` worked
 
 ## Credits

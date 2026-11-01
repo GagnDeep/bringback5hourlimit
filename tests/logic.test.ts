@@ -37,6 +37,7 @@ describe('blocks', () => {
   test('a new block records the weekly baseline when a fresh reading exists', async () => {
     expect(L.ensureBlock(undefined, T0, cfg(), ultra(40)).weeklyBase).toBe(40)
     expect(L.ensureBlock(undefined, T0 + 10 * HOUR, cfg(), ultra(40)).weeklyBase).toBe(undefined)
+    expect(L.ensureBlock(undefined, T0 + HOUR, cfg(), ultra(40)).weeklyBase).toBe(undefined)
   })
 })
 
@@ -106,20 +107,45 @@ describe('strategies', () => {
 
   test('weekly delta: growth, then a weekly reset mid-block carries the spend', async () => {
     let b = L.startBlock(T0, cfg(), 40)
-    b = L.observeWeekly(b, 46)
+    b = L.observeWeekly(b, 46).block
     expect(L.weeklySpent(b)).toBe(6)
-    b = L.observeWeekly(b, 2) // weekly window reset
+    b = L.observeWeekly(b, 2).block // weekly window reset
     expect(L.weeklySpent(b)).toBe(8)
-    b = L.observeWeekly(b, 5)
+    b = L.observeWeekly(b, 5).block
     expect(L.weeklySpent(b)).toBe(11)
   })
 
   test('weekly delta: no baseline at start takes the first reading', async () => {
     let b = L.startBlock(T0, cfg())
-    b = L.observeWeekly(b, 50)
+    b = L.observeWeekly(b, 50).block
     expect(L.weeklySpent(b)).toBe(0)
-    b = L.observeWeekly(b, 53.5)
+    b = L.observeWeekly(b, 53.5).block
     expect(L.weeklySpent(b)).toBe(3.5)
+  })
+
+  test('calibration ignores the first tick after a baseline and noise', async () => {
+    let b = L.startBlock(T0, cfg())
+    let r = L.observeWeekly(b, 40, 0)
+    expect(r.block.stepExact).toBe(false)
+    r = L.observeWeekly(r.block, 41, 500_000)
+    expect(r.sample).toBe(undefined)
+    expect(r.block.stepExact).toBe(true)
+    r = L.observeWeekly(r.block, 43, 4_500_000)
+    expect(r.sample).toEqual({ tokens: 4_000_000, pct: 2 })
+    expect(L.calibrate(undefined, r.sample!)).toEqual({ tokensPerPct: 2_000_000, samples: 1 })
+    expect(L.calibrate(undefined, { tokens: 5, pct: 1 })).toBe(undefined)
+    expect(L.calibrate({ tokensPerPct: 2_000_000, samples: 1 }, { tokens: 1_000_000, pct: 1 })).toEqual({ tokensPerPct: 1_600_000, samples: 2 })
+  })
+
+  test('liveLimits drops windows past their reset and stale snapshots', async () => {
+    const l: L.Limits = { at: T0, fiveHour: { pct: 50, resetsAt: T0 - 1 }, sevenDay: { pct: 30, resetsAt: T0 + HOUR } }
+    expect(L.liveLimits(l, T0, cfg())).toEqual({ at: T0, sevenDay: { pct: 30, resetsAt: T0 + HOUR } })
+    expect(L.liveLimits(l, T0 + 6 * HOUR, cfg())).toBe(undefined)
+  })
+
+  test('a new block takes its baseline only from a recent reading', async () => {
+    expect(L.ensureBlock(undefined, T0 + 10 * 60_000, cfg(), ultra(40)).weeklyBase).toBe(40)
+    expect(L.ensureBlock(undefined, T0 + 20 * 60_000, cfg(), ultra(40)).weeklyBase).toBe(undefined)
   })
 
   test('weightedTokens weighs cache reads at 10%', async () => {
@@ -134,9 +160,9 @@ describe('evaluation', () => {
     L.evaluate({ cfg: c, now: T0 + HOUR, block: b, limits, tokens, control })
 
   test('below warn is ok; warn threshold; cap at 100%', async () => {
-    expect(at(L.observeWeekly(block, 45), ultra(45, T0 + HOUR), 0).level).toBe('ok')
-    expect(at(L.observeWeekly(block, 52), ultra(52, T0 + HOUR), 0).level).toBe('warn')
-    const capped = at(L.observeWeekly(block, 55), ultra(55, T0 + HOUR), 0)
+    expect(at(L.observeWeekly(block, 45).block, ultra(45, T0 + HOUR), 0).level).toBe('ok')
+    expect(at(L.observeWeekly(block, 52).block, ultra(52, T0 + HOUR), 0).level).toBe('warn')
+    const capped = at(L.observeWeekly(block, 55).block, ultra(55, T0 + HOUR), 0)
     expect(capped.level).toBe('cap')
     expect(capped.blocks).toBe(true)
   })
@@ -207,7 +233,7 @@ describe('band layout', () => {
   const at = T0 + HOUR
   const status = (weekly: number, over: Partial<L.Config> = {}, control: L.Control = {}) => {
     let b = L.startBlock(T0, cfg(over), 40)
-    b = L.observeWeekly(b, weekly)
+    b = L.observeWeekly(b, weekly).block
     return { s: L.evaluate({ cfg: cfg(over), now: at, block: b, limits: ultra(weekly, at), tokens: 0, control }), c: cfg(over), control }
   }
   const text = (segs: L.Segment[]) => segs.map(x => x.text).join('')
@@ -256,6 +282,28 @@ describe('band layout', () => {
   test('a local estimate is marked with ≈', async () => {
     const s = L.evaluate({ cfg: cfg(), now: at, block: L.startBlock(T0, cfg()), limits: undefined, tokens: 2_500_000, control: {} })
     expect(text(L.bandLayout(L.bandData(s, at, cfg(), false, {}), 160))).toMatch(/ ≈25% used /)
+  })
+})
+
+describe('hint-line placement', () => {
+  test('room leaves space for the hidden mode indicator, the hint and another tail', async () => {
+    expect(L.hintRoom(140, 0, '(shift+tab to cycle)')).toBe(140 - (2 + 26 + 20 + 3 + 1))
+    expect(L.hintRoom(140, 0, '? for shortcuts')).toBe(140 - (2 + 15 + 3 + 1))
+    expect(L.hintRoom(140, 0, '? for shortcuts', 'other')).toBe(140 - (2 + 15 + 8 + 3 + 1))
+    expect(L.modesWidth([])).toBe(0)
+    expect(L.modesWidth(['plan'])).toBe(5)
+  })
+
+  test('the tail always fits its room, or is left out', async () => {
+    const block = L.observeWeekly(L.startBlock(T0, cfg(), 40), 52).block
+    const s = L.evaluate({ cfg: cfg(), now: T0, block, limits: ultra(52), tokens: 0, control: {} })
+    const d = L.bandData(s, T0, cfg(), false, {})
+    for (const room of [100, 60, 40, 20, 10, 7, 6, 0]) {
+      const t = L.hintTail(d, room)
+      expect([...t].length <= room).toBe(true)
+    }
+    expect(L.hintTail(d, 6)).toBe('')
+    expect(L.hintTail(d, 100)).toMatch(/^⚠ 5h limit █{8}░{2} 80% used/)
   })
 })
 

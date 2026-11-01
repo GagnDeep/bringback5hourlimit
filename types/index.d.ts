@@ -15,7 +15,7 @@ export type BandData = {
   timeZone: string
 }
 
-export type BandView = { data: BandData; show: boolean }
+export type BandView = { data: BandData; show: boolean; position: 'below' | 'above' }
 
 declare module 'claude-code' {
   interface PluginState {

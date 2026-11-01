@@ -9,7 +9,7 @@ import * as L from './logic'
 type $T = EngineInterface
 
 // The tag declines what an earlier version stored under this key.
-const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null, { shape: 'band-2' })
+const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null, { shape: 'band-3' })
 
 const TONE_COLOR: Record<L.Tone, 'warning' | 'error' | undefined> = {
   label: undefined, text: undefined, dim: undefined, track: undefined,
@@ -20,6 +20,7 @@ const KEY_BLOCK = 'block'
 const KEY_LIMITS = 'limits'
 const KEY_CONTROL = 'control'
 const KEY_OVERRIDES = 'overrides'
+const KEY_CALIBRATION = 'calibration'
 const KEY_TOK = 'tok:'
 const REFRESH_MS = 30_000
 const STALE_COUNTER_MS = 24 * 3_600_000
@@ -32,6 +33,8 @@ type Ctx = {
   lastCfg: L.Config
   lastStatus: L.Status | undefined
   mainTurnRunning: boolean
+  /** Cells the mode labels (`⏵⏵ auto mode on`) take on the hint row. */
+  modesWidth: number
   toasted: Set<string>
   noted: Set<string>
 }
@@ -63,6 +66,7 @@ async function envLayer($: $T): Promise<Record<string, unknown>> {
     warnPct: await $.env.get('BB5H_WARN_PCT'),
     failMode: await $.env.get('BB5H_FAIL_MODE'),
     showBar: await $.env.get('BB5H_SHOW_BAR'),
+    barPosition: await $.env.get('BB5H_BAR_POSITION'),
     timeZone: await $.env.get('BB5H_TIMEZONE'),
   }
 }
@@ -97,16 +101,22 @@ async function readTokens($: $T, blockStart: number): Promise<number> {
   return L.sumTokens(counters, blockStart)
 }
 
-async function saveLimits($: $T, fresh: L.Limits | undefined): Promise<void> {
+/**
+ * Stores a reading. A pushed one (`session.measure`) is fresh by definition;
+ * a polled one is the last response's figures, so it only counts as new when
+ * they changed: otherwise hours-old numbers would keep passing as current.
+ */
+async function saveLimits($: $T, fresh: L.Limits | undefined, isPushed: boolean): Promise<void> {
   if (!fresh) return
   const stored = await getJSON<L.Limits>($, KEY_LIMITS)
+  if (!isPushed && L.sameLimits(stored, fresh)) return
   if (L.mergeLimits(stored, fresh) === fresh) await $.store.set(KEY_LIMITS, fresh)
 }
 
 async function readLimits($: $T, now: number): Promise<L.Limits | undefined> {
   try {
     const usage = await $.session.usage()
-    await saveLimits($, L.parseRateLimits(usage.rateLimits, now))
+    await saveLimits($, L.parseRateLimits(usage.rateLimits, now), false)
   } catch {
     // The usage source failed: strategy selection degrades on stale data.
   }
@@ -124,13 +134,24 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
   const stored = await getJSON<L.Block>($, KEY_BLOCK)
   const isIdle = !L.isActive(stored, now) && !start
   let block = L.ensureBlock(stored, now, cfg, limits)
+  const tokens = isIdle ? 0 : await readTokens($, block.startedAt)
+  let calibration = await getJSON<L.Calibration>($, KEY_CALIBRATION)
   if (!isIdle) {
-    const fresh = L.isFresh(limits, now, cfg) ? limits : undefined
-    if (fresh?.sevenDay && fresh.at >= block.startedAt - 60_000) block = L.observeWeekly(block, fresh.sevenDay.pct)
+    const fresh = L.liveLimits(limits, now, cfg)
+    if (fresh?.sevenDay && fresh.at >= block.startedAt - L.BASELINE_MAX_AGE_MS) {
+      const seen = L.observeWeekly(block, fresh.sevenDay.pct, tokens)
+      block = seen.block
+      if (seen.sample) {
+        const learned = L.calibrate(calibration, seen.sample)
+        if (learned && learned !== calibration) {
+          calibration = learned
+          await $.store.set(KEY_CALIBRATION, learned)
+        }
+      }
+    }
     block = await writeBlock($, block, now)
   }
-  const tokens = isIdle ? 0 : await readTokens($, block.startedAt)
-  const status = L.evaluate({ cfg, now, block, limits, tokens, control })
+  const status = L.evaluate({ cfg, now, block, limits, tokens, control, ...(calibration ? { calibration } : {}) })
   ctx.lastStatus = status
   await publish($, cfg, status, now, isIdle, control)
   return { cfg, invalid, now, block, isIdle, control, status }
@@ -138,9 +159,10 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
 
 async function publish($: $T, cfg: L.Config, status: L.Status, now: number, isIdle: boolean, control: L.Control): Promise<void> {
   const data = L.bandData(status, now, cfg, isIdle, control)
-  const next: BandView = { data, show: cfg.showBar }
+  const next: BandView = { data, show: cfg.showBar, position: cfg.barPosition }
   // `now` only matters at minute resolution: skip writes that draw the same.
-  const key = (v: BandView | null) => (v ? JSON.stringify({ ...v.data, now: Math.floor(v.data.now / 60_000) }) + v.show : '')
+  const key = (v: BandView | null) =>
+    v ? JSON.stringify({ ...v.data, now: Math.floor(v.data.now / 60_000) }) + v.show + v.position : ''
   await update($, view, prev => (key(prev) === key(next) ? prev : next))
 }
 
@@ -213,19 +235,21 @@ async function onTick($: $T, ctx: Ctx): Promise<void> {
 }
 
 async function onMeasure($: $T, ctx: Ctx, rateLimits: readonly L.RateLimitLike[], changed: readonly string[]): Promise<void> {
-  if (changed.includes('rateLimits')) await saveLimits($, L.parseRateLimits(rateLimits, await $.clock.now()))
+  // Every measurement is a fresh reading, whatever moved.
+  await saveLimits($, L.parseRateLimits(rateLimits, await $.clock.now()), true)
+  void changed
   await react($, ctx, await snapshot($, ctx, false))
 }
 
-async function onTurnComplete($: $T, ctx: Ctx, usage: L.UsageLike | undefined): Promise<void> {
+/** Counts one model request's tokens against the block (any session, any loop). */
+async function countUsage($: $T, ctx: Ctx, usage: L.UsageLike | undefined): Promise<void> {
   const tokens = L.weightedTokens(usage)
-  if (tokens > 0) {
-    const sid = await ensureSessionId($, ctx)
-    const live = await snapshot($, ctx, true) // activity starts a block
-    const key = KEY_TOK + sid
-    const counter = await getJSON<L.TokenCounter>($, key)
-    await $.store.set(key, L.addTokens(counter, live.block.startedAt, tokens, live.now))
-  }
+  if (tokens <= 0) return
+  const sid = await ensureSessionId($, ctx)
+  const live = await snapshot($, ctx, true) // activity starts a block
+  const key = KEY_TOK + sid
+  const counter = await getJSON<L.TokenCounter>($, key)
+  await $.store.set(key, L.addTokens(counter, live.block.startedAt, tokens, live.now))
   await react($, ctx, await snapshot($, ctx, false))
 }
 
@@ -282,6 +306,13 @@ async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
       await snapshot($, ctx, false)
       return `Unlocked for this block (one-time). The cap re-engages at ${L.formatReset(live.block.endsAt, live.now, tz)}. /5h on to re-lock now.`
     }
+    case 'toggleBar': {
+      const current = (await getJSON<Record<string, unknown>>($, KEY_OVERRIDES)) ?? {}
+      const show = !snap.cfg.showBar
+      await $.store.set(KEY_OVERRIDES, { ...current, showBar: show })
+      await snapshot($, ctx, false)
+      return show ? `Bar on (${snap.cfg.barPosition} the prompt). /5h bar to hide.` : 'Bar hidden. /5h bar to show it again.'
+    }
     case 'reset': {
       await $.store.delete(KEY_OVERRIDES)
       await snapshot($, ctx, false)
@@ -307,6 +338,7 @@ export const register: Register = (on, options) => {
     lastCfg: L.DEFAULTS,
     lastStatus: undefined,
     mainTurnRunning: false,
+    modesWidth: 0,
     toasted: new Set(),
     noted: new Set(),
   }
@@ -327,8 +359,15 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // Each model request's usage, as it lands, so the bar moves mid-turn.
+  // The stream passes through untouched; counting never fails the request.
+  on('turn.step', async function* ($, e, next) {
+    const r = yield* next(e)
+    await countUsage($, ctx, r.usage ?? undefined).catch(err => logError($, err))
+    return r
+  })
+
   on('turn.complete', async ($, e, next) => {
-    await onTurnComplete($, ctx, e.usage).catch(err => logError($, err))
     if (e.agentId === undefined) ctx.mainTurnRunning = false
     return next(e)
   })
@@ -365,15 +404,37 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: '5h' }, async ($, e) => ({ text: await runCommand($, ctx, e.args) }))
 
+  // Observe only: the mode labels share the hint row, so their width is
+  // what the bar must leave room for.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const width = L.modesWidth(e.props.modes)
+    if (width !== ctx.modesWidth) {
+      ctx.modesWidth = width
+      $.ui.invalidate('ui.render')
+    }
+    return next(e)
+  })
+
+  // Default: the bar rides at the end of the dim hint line under the input.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const v = await read($, view)
+    if (!v || !v.show || v.position !== 'below') return next(e)
+    const room = L.hintRoom(e.viewport?.columns ?? 100, ctx.modesWidth, e.props.hint, e.props.tail)
+    const own = L.hintTail(v.data, room)
+    if (!own) return next(e)
+    const tail = e.props.tail ? `${e.props.tail} · ${own}` : own
+    return next({ ...e, props: { ...e.props, tail } })
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const v = await read($, view)
-    if (!v || !v.show || e.props.hasSurvey) return next(e)
+    if (!v || !v.show || v.position !== 'above' || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const segments = L.bandLayout(v.data, e.props.bodyColumns)
     // Quiet grey while all is well; colour only near or past the limit.
     const isAlert = v.data.level === 'warn' || v.data.level === 'cap' || v.data.level === 'failing'
     return (
-      <Box flexDirection="row" flexWrap="nowrap" overflow="hidden">
+      <Box flexDirection="row" flexWrap="nowrap" overflow="hidden" marginTop={1}>
         {segments.map(seg =>
           isAlert ? (
             <Text
