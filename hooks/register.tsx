@@ -11,9 +11,9 @@ type $T = EngineInterface
 // The tag declines what an earlier version stored under this key.
 const view = atom({ plugin: 'bringback5hourlimit', key: 'view' } as const, null as BandView | null, { shape: 'band-2' })
 
-const TONE_COLOR: Record<L.Tone, 'success' | 'warning' | 'error' | undefined> = {
+const TONE_COLOR: Record<L.Tone, 'warning' | 'error' | undefined> = {
   label: undefined, text: undefined, dim: undefined, track: undefined,
-  ok: 'success', warn: 'warning', error: 'error',
+  ok: undefined, warn: 'warning', error: 'error',
 }
 
 const KEY_BLOCK = 'block'
@@ -370,17 +370,23 @@ export const register: Register = (on, options) => {
     if (!v || !v.show || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const segments = L.bandLayout(v.data, e.props.bodyColumns)
+    // Quiet grey while all is well; colour only near or past the limit.
+    const isAlert = v.data.level === 'warn' || v.data.level === 'cap' || v.data.level === 'failing'
     return (
       <Box flexDirection="row" flexWrap="nowrap" overflow="hidden">
-        {segments.map(seg => (
-          <Text
-            bold={seg.tone === 'label' || seg.tone === 'error'}
-            color={TONE_COLOR[seg.tone]}
-            dimColor={seg.tone === 'dim' || seg.tone === 'track'}
-          >
-            {seg.text}
-          </Text>
-        ))}
+        {segments.map(seg =>
+          isAlert ? (
+            <Text
+              bold={seg.tone === 'label' || seg.tone === 'error'}
+              color={TONE_COLOR[seg.tone]}
+              dimColor={seg.tone === 'dim' || seg.tone === 'track'}
+            >
+              {seg.text}
+            </Text>
+          ) : (
+            <Text dimColor>{seg.text}</Text>
+          ),
+        )}
       </Box>
     )
   })

@@ -5,10 +5,10 @@ A Claude Code mod that brings back the **rolling 5-hour usage limit** as a **loc
 When your 5-hour budget runs out, new prompts and new subagents are refused until the block resets. The work already running is allowed to finish. This means a runaway agent or a late night can't burn a big share of your weekly limit in one go.
 
 ```
-5h limit ━━━━━━━━──── 72% used · resets in 2h 13m (3:40 PM) · week 41%
+5h limit ███████░░░ 72% used · resets in 2h 13m (3:40 PM) · week 41%
 ```
 
-The bar fits the space it has. On a narrow terminal it shrinks to `5h ━━━━── 72% · 2h 13m left · wk 41%`, then to `5h 72% · 2h 13m`. It's green normally, yellow near the limit, red once the limit is reached (`5h limit reached · new prompts & agents paused · resets in 1h 2m`), and `≈` marks a local estimate.
+The bar fits the space it has. On a narrow terminal it shrinks to `5h ████░░ 72% · 2h 13m left · wk 41%`, then to `5h 72% · 2h 13m`. It's a quiet grey normally, yellow near the limit, red once the limit is reached (`5h limit reached · new prompts & agents paused · resets in 1h 2m`), and `≈` marks a local estimate.
 
 ## Install
 

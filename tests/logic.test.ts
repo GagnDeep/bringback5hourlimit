@@ -215,7 +215,7 @@ describe('band layout', () => {
 
   test('wide: label, bar, % used, countdown with clock, week', async () => {
     const out = text(L.bandLayout(data(status(46)), 160))
-    expect(out).toMatch(/^5h limit ━{5}─{7} 40% used · resets in 4h 0m \(4:30\sPM\) · week 46%$/)
+    expect(out).toMatch(/^5h limit █{4}░{6} 40% used · resets in 4h 0m \(4:30\sPM\) · week 46%$/)
     expect(out).not.toMatch(/Δ|wk\b/)
   })
 
@@ -226,8 +226,8 @@ describe('band layout', () => {
       expect([...out].length <= cols).toBe(true)
     }
     expect(text(L.bandLayout(d, 160))).toMatch(/\(4:30\sPM\)/)
-    expect(text(L.bandLayout(d, 60))).toBe('5h limit ━━━━────── 40% used · resets in 4h 0m · week 46%')
-    expect(text(L.bandLayout(d, 45))).toBe('5h ━━──── 40% · 4h 0m left · wk 46%')
+    expect(text(L.bandLayout(d, 60))).toBe('5h limit ████░░░░░░ 40% used · resets in 4h 0m · week 46%')
+    expect(text(L.bandLayout(d, 45))).toBe('5h ██░░░░ 40% · 4h 0m left · wk 46%')
     expect(text(L.bandLayout(d, 20))).toBe('5h 40% · 4h 0m')
     expect(text(L.bandLayout(d, 8))).toBe('5h 40%')
   })

@@ -100,13 +100,13 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 A one-line band above the prompt, laid out for the width it has (`bandLayout`, pure). It uses the richest variant that fits:
 
 ```
-5h limit ━━━━━━━━──── 72% used · resets in 2h 13m (3:40 PM) · week 41%   (wide)
-5h limit ━━━━━━━─── 72% used · resets in 2h 13m · week 41%               (medium)
-5h ━━━━── 72% · 2h 13m left · wk 41%                                     (narrow)
+5h limit ███████░░░ 72% used · resets in 2h 13m (3:40 PM) · week 41%   (wide)
+5h limit ███████░░░ 72% used · resets in 2h 13m · week 41%               (medium)
+5h ████░░ 72% · 2h 13m left · wk 41%                                     (narrow)
 5h 72% · 2h 13m                                                           (tiny)
 ```
 
-- **Colours:** the label is bold, the empty track dim, and the % is green, then yellow at `warn`. At the cap the band switches to red text: `5h limit reached · new prompts & agents paused · resets in … · /5h unlock to override`.
+- **Colours:** the whole band is dim grey while all is well. At `warn` the % turns yellow, and at the cap the band switches to red text: `5h limit reached · new prompts & agents paused · resets in … · /5h unlock to override`.
 - **Wording per state:**
   - idle: `5h limit ready · starts with your next prompt · week 56%`
   - off: `paused until …`

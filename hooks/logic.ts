@@ -458,8 +458,8 @@ const width = (segs: readonly Segment[]) => segs.reduce((n, s) => n + [...s.text
 function bar(pct: number, cells: number, tone: Tone): Segment[] {
   const filled = Math.max(pct > 0 ? 1 : 0, Math.min(cells, Math.round((pct / 100) * cells)))
   const out: Segment[] = []
-  if (filled > 0) out.push({ text: '━'.repeat(filled), tone })
-  if (cells - filled > 0) out.push({ text: '─'.repeat(cells - filled), tone: 'track' })
+  if (filled > 0) out.push({ text: '█'.repeat(filled), tone })
+  if (cells - filled > 0) out.push({ text: '░'.repeat(cells - filled), tone: 'track' })
   return out
 }
 
@@ -519,7 +519,7 @@ export function bandLayout(d: BandData, columns: number): Segment[] {
       const tag = d.level === 'unlocked' ? [t(' · unlocked', 'warn')] : []
       const used = `${pctText} used`
       variants = [
-        [t(`${W} limit `, 'label'), ...bar(d.pct, 12, tone), t(` ${used}`, tone), ...tag, t(` · resets in ${left} (${clock})`), ...week(true)],
+        [t(`${W} limit `, 'label'), ...bar(d.pct, 10, tone), t(` ${used}`, tone), ...tag, t(` · resets in ${left} (${clock})`), ...week(true)],
         [t(`${W} limit `, 'label'), ...bar(d.pct, 10, tone), t(` ${used}`, tone), ...tag, t(` · resets in ${left}`), ...week(true)],
         [t(`${W} `, 'label'), ...bar(d.pct, 6, tone), t(` ${pctText}`, tone), ...tag, t(` · ${left} left`), ...week(false)],
         [t(`${W} `, 'label'), t(pctText, tone), t(` · ${left}`)],
