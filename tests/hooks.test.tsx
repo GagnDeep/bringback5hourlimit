@@ -3,6 +3,7 @@ import type { On } from 'claude-code'
 import { type Engine, describe, expect, test } from 'claude-code/testing'
 
 import { HOUR, MIN, T0, cmd, iso, measureInput, prompt, spawnInput, step, world } from './world'
+import type { RateLimit } from './world'
 
 const ULTRA = (pct: number) => [{ kind: 'seven_day', percentUsed: pct, resetsAt: iso(T0 + 3 * 24 * HOUR) }]
 const MAX = (pct5: number) => [
@@ -83,7 +84,7 @@ describe('verified Ultra (weekly window only)', () => {
     const w = world(on, { rateLimits: ULTRA(40) })
     await $.session.start(START)
     await $.prompt.submit(prompt('start'))
-    w.store.set('notified', T0) // another session already notified for this block
+    w.store.set('notified', String(T0)) // another session already notified for this block
     w.setLimits(ULTRA(60))
     await $.session.measure(measureInput(ULTRA(60)))
     expect(w.notifications.length).toBe(0)
@@ -471,5 +472,92 @@ describe('configuration', () => {
     w.setLimits(ULTRA(45))
     await $.session.measure(measureInput(ULTRA(45)))
     expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/3h limit is reached/)
+  })
+})
+
+describe('v1.2.5 regressions', () => {
+  const FIVE_RESET = T0 + 2 * HOUR
+  const maxAt = (pct5: number, pct7: number): RateLimit[] => [
+    { kind: 'five_hour', percentUsed: pct5, resetsAt: iso(FIVE_RESET) },
+    { kind: 'seven_day', percentUsed: pct7, resetsAt: iso(T0 + 3 * 24 * HOUR) },
+  ]
+
+  test("after Anthropic's 5-hour window resets, a Max block is not judged by its share of the week", async ($, on) => {
+    const w = world(on, { rateLimits: maxAt(10, 30) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    // A heavy window: 20 points of the week, more than the 15% weekly budget.
+    w.setLimits(maxAt(85, 50))
+    await $.session.measure(measureInput(maxAt(85, 50)))
+    await w.clock.advance(2 * HOUR + 5 * MIN) // Anthropic's window is over; the local block is not
+    const r = await $.prompt.submit(prompt('new window'))
+    expect(r.drop).toBe(undefined)
+    expect(((await $.command.run(cmd('status'))).text ?? '')).not.toMatch(/share of your week/)
+  })
+
+  test('mode=official, fail-closed: the gap after a 5-hour reset is not "no data"', async ($, on) => {
+    const w = world(on, { rateLimits: maxAt(10, 30), env: { BB5H_MODE: 'official', BB5H_FAIL_MODE: 'closed' } })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    await w.clock.advance(2 * HOUR + 5 * MIN)
+    expect((await $.prompt.submit(prompt('next'))).drop).toBe(undefined)
+  })
+
+  test('fail-closed with no data: /5h off, as the refusal advises, lets prompts through', async ($, on) => {
+    world(on, { usageThrows: true, env: { BB5H_MODE: 'weekly', BB5H_FAIL_MODE: 'closed' } })
+    await $.session.start(START)
+    expect((await $.prompt.submit(prompt('a'))).drop).toMatch(/fail mode is "closed"/)
+    await $.command.run(cmd('off'))
+    expect((await $.prompt.submit(prompt('b'))).drop).toBe(undefined)
+  })
+
+  test("on Anthropic's 5-hour window, unlock lasts until that window resets", async ($, on) => {
+    const w = world(on, { rateLimits: maxAt(50, 30) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    w.setLimits(maxAt(95, 31))
+    expect((await $.prompt.submit(prompt('b'))).drop).toMatch(/limit is reached/)
+    await $.command.run(cmd('unlock'))
+    expect(w.store.get('control')).toEqual({ unlockedUntil: FIVE_RESET })
+    expect((await $.prompt.submit(prompt('c'))).drop).toBe(undefined)
+  })
+
+  test('unlock after a wrap-up note tells the model the cap is lifted', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    await $.turn.start({ text: 'start', turnId: 't1' } as never)
+    w.setLimits(ULTRA(57))
+    await $.session.measure(measureInput(ULTRA(57)))
+    await $.command.run(cmd('unlock'))
+    const lifted = w.session.appended().filter(r => JSON.stringify(r.message).includes('lifted'))
+    expect(lifted.length).toBe(1)
+  })
+
+  test('parallel steps in one process never lose each other\'s tokens', async ($, on) => {
+    const w = world(on, { env: { BB5H_MODE: 'tokens', BB5H_TOKEN_BUDGET: '1000000' } })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    const run = (agentId: string) => {
+      const s = $.turn.step({ turnId: agentId, index: 0, model: 'claude-test', messageCount: 1, agentId } as never)
+      return (async () => { let r = await s.next(); while (r.done !== true) r = await s.next() })()
+    }
+    // Each step reports 1000 tokens.
+    w.stickyUsage = { input_tokens: 1000 }
+    const many = Array.from({ length: 5 }, (_, i) => run(`ag${i}`))
+    await Promise.all(many)
+    expect((w.store.get('tok:sess-A') as { tokens: number }).tokens).toBe(5000)
+  })
+
+  test("deleting a day-old counter keeps the week's token total, and spares the running block's", async ($, on) => {
+    const store = new Map<string, unknown>()
+    store.set('block', { startedAt: T0 - HOUR, endsAt: T0 + 100 * HOUR, weeklyCarried: 0 })
+    store.set('tok:old', { blockStart: T0 - 50 * HOUR, tokens: 10, at: T0 - 30 * HOUR, total: 7000 })
+    store.set('tok:long', { blockStart: T0 - HOUR, tokens: 500, at: T0 - 30 * HOUR, total: 500 })
+    world(on, { store, env: { BB5H_WINDOW_HOURS: '101' } })
+    await $.session.start(START)
+    expect(store.has('tok:old')).toBe(false)
+    expect(store.get('retiredTotal')).toBe(7000)
+    expect(store.has('tok:long')).toBe(true)
   })
 })

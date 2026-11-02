@@ -24,6 +24,8 @@ const KEY_CALIBRATION = 'calibration'
 const KEY_TOK = 'tok:'
 const KEY_NOTIFIED = 'notified'
 const KEY_TRACK = 'weeklyTrack'
+/** Lifetime tokens of deleted session counters, so the all-sessions total never drops. */
+const KEY_RETIRED = 'retiredTotal'
 const REFRESH_MS = 30_000
 const STALE_COUNTER_MS = 24 * 3_600_000
 const HOUR = 3_600_000
@@ -39,6 +41,8 @@ type Ctx = {
   modesWidth: number
   toasted: Set<string>
   noted: Set<string>
+  /** Serialises this process's counter updates (parallel subagents' steps). */
+  counting: Promise<void>
 }
 
 type Snapshot = {
@@ -156,12 +160,12 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
   const stored = await getJSON<L.Block>($, KEY_BLOCK)
   const isIdle = !L.isActive(stored, now) && !start
   const counters = await readCounters($)
-  const total = L.sumTotals(counters)
+  const total = L.sumTotals(counters) + Math.max(0, Number(await getJSON<number>($, KEY_RETIRED)) || 0)
   const fresh = L.liveLimits(limits, now, cfg)
   // The tracker follows the week even between blocks.
   const followed = await track($, fresh, total, await getJSON<L.Calibration>($, KEY_CALIBRATION))
   const calibration = followed.calibration
-  const ratio = calibration?.tokensPerPct ?? L.DEFAULT_TOKENS_PER_WEEKLY_PCT
+  const ratio = L.ratioOf(calibration)
   let block = L.ensureBlock(stored, now, cfg, limits, L.weeklyPosition(followed.track, total, ratio))
   const tokens = isIdle ? 0 : L.sumTokens(counters, block.startedAt)
   if (!isIdle) {
@@ -185,11 +189,19 @@ async function publish($: $T, cfg: L.Config, status: L.Status, now: number, isId
   await update($, view, prev => (key(prev) === key(next) ? prev : next))
 }
 
+/**
+ * What "once per block" means: Anthropic's 5-hour window when the cap follows
+ * it (it need not line up with the local block), else the local block.
+ */
+function windowId(s: L.Status, block: L.Block): string {
+  return s.strategy === 'official' && !s.windowEnded ? `5h:${s.resetsAt}` : String(block.startedAt)
+}
+
 /** Warnings and the wrap-up note, once per block. */
 async function react($: $T, ctx: Ctx, snap: Snapshot): Promise<void> {
   const { status: s, block, now, cfg } = snap
   if (snap.isIdle) return
-  const id = String(block.startedAt)
+  const id = windowId(s, block)
   if (s.level === 'warn' && !ctx.toasted.has(`${id}:warn`)) {
     ctx.toasted.add(`${id}:warn`)
     $.ui.toast(`${s.windowLabel} budget at ${Math.floor(s.pct)}% · resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}`, { timeoutMs: 8000 })
@@ -202,8 +214,8 @@ async function react($: $T, ctx: Ctx, snap: Snapshot): Promise<void> {
       { timeoutMs: 12000 },
     )
     // One desktop notification per block, however many sessions are open.
-    if ((await getJSON<number>($, KEY_NOTIFIED)) !== block.startedAt) {
-      await $.store.set(KEY_NOTIFIED, block.startedAt)
+    if ((await getJSON<unknown>($, KEY_NOTIFIED)) !== id) {
+      await $.store.set(KEY_NOTIFIED, id)
       await $.ui.notify(`${s.windowLabel} budget spent. Resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}.`, { title: 'bringback5hourlimit' }).catch(() => undefined)
     }
   }
@@ -220,11 +232,26 @@ async function react($: $T, ctx: Ctx, snap: Snapshot): Promise<void> {
 }
 
 async function note($: $T, ctx: Ctx, s: L.Status, now: number, cfg: L.Config, block: L.Block, agentId: string | undefined): Promise<void> {
-  const key = `${block.startedAt}:${agentId ?? 'main'}`
+  const key = `${windowId(s, block)}:${agentId ?? 'main'}`
   if (ctx.noted.has(key)) return
   ctx.noted.add(key)
   const message = { type: 'user' as const, content: [{ type: 'text' as const, text: L.wrapUpNote(s, now, cfg.timeZone) }] }
   await $.session.append(agentId ? { message, agentId } : { message }).catch(() => undefined)
+}
+
+/**
+ * After /5h unlock or /5h off: the loops told to wrap up hear that the cap is
+ * lifted, or the earlier note keeps steering them to stop.
+ */
+async function liftNotes($: $T, ctx: Ctx): Promise<void> {
+  const keys = [...ctx.noted]
+  ctx.noted.clear()
+  const text = '[bringback5hourlimit] The user lifted their self-imposed usage cap. Disregard the earlier request to wrap up; continue normally.'
+  for (const k of keys) {
+    const agent = k.slice(k.lastIndexOf(':') + 1)
+    const message = { type: 'user' as const, content: [{ type: 'text' as const, text }] }
+    await $.session.append(agent === 'main' ? { message } : { message, agentId: agent }).catch(() => undefined)
+  }
 }
 
 function logError($: $T, err: unknown): void {
@@ -242,9 +269,16 @@ async function onSessionStart($: $T, ctx: Ctx): Promise<void> {
     immediate: true,
   })
   const now = await $.clock.now()
+  const block = await getJSON<L.Block>($, KEY_BLOCK)
+  const activeStart = L.isActive(block, now) ? block.startedAt : undefined
   for (const k of (await $.store.keys()).filter(k => k.startsWith(KEY_TOK))) {
     const c = await getJSON<L.TokenCounter>($, k)
-    if (!c || now - c.at > STALE_COUNTER_MS) await $.store.delete(k)
+    if (!L.isStaleCounter(c, now, activeStart, STALE_COUNTER_MS)) continue
+    // Retire its lifetime tokens first, so the weekly tracker's total holds.
+    const retired = Math.max(0, Number(await getJSON<number>($, KEY_RETIRED)) || 0)
+    const t = L.sumTotals([c])
+    if (t > 0) await $.store.set(KEY_RETIRED, retired + t)
+    await $.store.delete(k)
   }
   await snapshot($, ctx, false)
 }
@@ -271,8 +305,14 @@ async function countUsage($: $T, ctx: Ctx, usage: L.UsageLike | undefined): Prom
   const sid = await ensureSessionId($, ctx)
   const live = await snapshot($, ctx, true) // activity starts a block
   const key = KEY_TOK + sid
-  const counter = await getJSON<L.TokenCounter>($, key)
-  await $.store.set(key, L.addTokens(counter, live.block.startedAt, tokens, live.now))
+  // Read-add-write, one at a time: parallel subagents finishing steps
+  // together would otherwise overwrite each other's tokens.
+  const add = ctx.counting.then(async () => {
+    const counter = await getJSON<L.TokenCounter>($, key)
+    await $.store.set(key, L.addTokens(counter, live.block.startedAt, tokens, live.now))
+  })
+  ctx.counting = add.catch(() => undefined)
+  await add
   await react($, ctx, await snapshot($, ctx, false))
 }
 
@@ -321,6 +361,7 @@ async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
         : snap.block.endsAt
       await $.store.set(KEY_CONTROL, { ...snap.control, offUntil: until })
       await snapshot($, ctx, false)
+      await liftNotes($, ctx)
       return `Cap paused until ${L.formatReset(until, snap.now, tz)}. /5h on to resume.`
     }
     case 'on': {
@@ -330,9 +371,14 @@ async function runCommand($: $T, ctx: Ctx, args: string): Promise<string> {
     }
     case 'unlock': {
       const live = await snapshot($, ctx, true)
-      await $.store.set(KEY_CONTROL, { ...live.control, unlockedBlock: live.block.startedAt })
+      // On Anthropic's 5-hour window the unlock lasts until that window resets.
+      const official = live.status.strategy === 'official' && !live.status.windowEnded
+      const until = official ? live.status.resetsAt : live.block.endsAt
+      const { unlockedBlock: _b, unlockedUntil: _u, ...rest } = live.control
+      await $.store.set(KEY_CONTROL, official ? { ...rest, unlockedUntil: until } : { ...rest, unlockedBlock: live.block.startedAt })
       await snapshot($, ctx, false)
-      return `Unlocked for this block (one-time). The cap re-engages at ${L.formatReset(live.block.endsAt, live.now, tz)}. /5h on to re-lock now.`
+      await liftNotes($, ctx)
+      return `Unlocked for this block (one-time). The cap re-engages at ${L.formatReset(until, live.now, tz)}. /5h on to re-lock now.`
     }
     case 'toggleBar': {
       const current = (await getJSON<Record<string, unknown>>($, KEY_OVERRIDES)) ?? {}
@@ -369,6 +415,7 @@ export const register: Register = (on, options) => {
     modesWidth: 0,
     toasted: new Set(),
     noted: new Set(),
+    counting: Promise.resolve(),
   }
 
   on('session.start', async ($, e, next) => {

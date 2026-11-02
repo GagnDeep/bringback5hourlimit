@@ -36,6 +36,8 @@ Invalid values fall back to the next layer down and are reported in `/5h status`
 1. **official**: `five_hour` is present in the latest fresh `rateLimits` snapshot.
    - used = Anthropic's %, budget = `officialCapPct`, reset = Anthropic's `resetsAt`.
    - The block *is* Anthropic's window, so `windowHours` does not apply.
+   - A `five_hour` window past its reset still selects this strategy, with 0% used, until the next request opens the next window. Switching strategy in that gap would judge a Max/Pro block by its share of the week and could refuse the prompt that starts the new window.
+   - `/5h unlock` lasts until Anthropic's window resets (`control.unlockedUntil`), and toasts, the notification and the wrap-up note are once per Anthropic window, since it need not line up with the local block.
 2. **weekly** (verified Ultra): `seven_day` is present and `five_hour` absent.
    - At block start the mod records `weeklyBase` = the latest weekly %.
    - spent = `weeklyCarried + (weeklyLast − weeklyBase)`.
@@ -70,7 +72,8 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 - **Concurrency:**
   - `mergeBlock(a, b, now)` is deterministic: the earliest *active* block wins, and fields at the same start are combined with min/max. Every writer re-reads, merges and writes, so racing sessions converge.
   - Token counters are per session (`tok:<sessionId>` = `{ blockStart, tokens, at }`). Each session writes only its own key, so there are no lost updates. The block total is the sum over keys with the matching `blockStart`.
-  - Stale counter keys are removed after 24 h.
+  - Counter writes in one process are serialised (parallel subagents finish steps together; a read-add-write race would lose tokens).
+  - Counter keys untouched for 24 h are removed, except one in the running block (a block may be longer than a day). Their lifetime `total` moves to `retiredTotal` first, so the weekly tracker's all-sessions total never drops.
 
 ## Enforcement
 `evaluate()` computes `pct = used / budget × 100`, then a level:
@@ -88,6 +91,8 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 - **Agents** (`agent.spawn`): new agents at `cap` get `{ deny }`. Resumes (`e.resume`, a SendMessage waking a parked subagent) pass: they continue work already running.
 - **In-flight work** is never killed and tool calls are never refused.
   - When the cap is reached mid-turn (seen on `session.measure`, `turn.complete` or `tool.call`), the mod appends one hidden user note per loop per block via `$.session.append`: *finish the current step, leave files consistent, start nothing large, summarize what's left*.
+  - `/5h unlock` or `/5h off` appends a follow-up to each loop that got the note: the cap is lifted, continue normally.
+  - A weekly reset inside a block carries the spend including the estimate past the last whole point.
 - **Warning:**
   - Crossing `warnPct` shows one toast per block.
   - Crossing the cap shows one toast plus a native notification.
@@ -97,7 +102,7 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 ## Failure mode
 - If a forced strategy has no data, or evaluation throws:
   - `open`: allow, and show `⚠ cap not enforcing: <reason>` in the band and a toast.
-  - `closed`: refuse with that reason.
+  - `closed`: refuse with that reason. `/5h off` and `/5h unlock` lift it, as the refusal says.
 - Guards carry `.catch(…)` handlers that apply the same policy, so a crashing hook also obeys `failMode`.
 - In `auto`, a missing usage source is not an error: it degrades to `tokens`, and the band says so.
 

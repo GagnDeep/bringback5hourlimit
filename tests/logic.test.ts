@@ -470,3 +470,27 @@ describe('/5h parsing', () => {
     expect(L.applySet({}, 'windowHours', '3')).toEqual({ overrides: { windowHours: 3 } })
   })
 })
+
+describe('v1.2.5 logic', () => {
+  test('a weekly reset mid-block carries the estimate past the last whole point too', async () => {
+    const cfg = { ...L.DEFAULTS }
+    let b = L.startBlock(0, cfg, 50, 0)
+    b = L.observeWeekly(b, 52, 0, 1000 + 7 * 24 * 3_600_000, 1_000_000).block
+    // Half a point of tokens since the tick, then the week resets.
+    b = L.observeWeekly(b, 1, 500_000, 1000 + 14 * 24 * 3_600_000, 1_000_000).block
+    expect(b.weeklyCarried).toBe(2.5)
+  })
+
+  test('corrupt counters and calibration never turn usage into NaN', async () => {
+    expect(L.sumTokens([{ blockStart: 1, tokens: Number.NaN, at: 1 }, { blockStart: 1, tokens: 5, at: 1 }], 1)).toBe(5)
+    expect(L.ratioOf({ tokensPerPct: 0, samples: 1 })).toBe(L.DEFAULT_TOKENS_PER_WEEKLY_PCT)
+  })
+
+  test('failing honours /5h off and unlock', async () => {
+    const cfg = { ...L.DEFAULTS, mode: 'weekly' as const, failMode: 'closed' as const }
+    const block = L.startBlock(0, cfg)
+    const s = L.evaluate({ cfg, now: 10, block, limits: undefined, tokens: 0, control: { offUntil: 100 } })
+    expect(s.blocks).toBe(false)
+    expect(L.evaluate({ cfg, now: 10, block, limits: undefined, tokens: 0, control: {} }).blocks).toBe(true)
+  })
+})

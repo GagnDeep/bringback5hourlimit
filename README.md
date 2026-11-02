@@ -100,6 +100,8 @@ You can also force one of these with `mode`. For example, `/5h set mode tokens` 
 - **It relies on the Claude Code mods API**, which is early access and may change. If the usage data disappears, the mod falls back to counting tokens and says so in the bar.
 - **The weekly % only updates when Anthropic reports it**, in whole points, with each response. Between points the bar is an estimate (`≈`), and it's rougher until the mod has seen your week tick a couple of times. Usage on claude.ai or another machine shows up at the next whole point.
 - **Across machines** only the weekly % is shared, because it's account-wide. The block timer, `/5h off` and `/5h unlock` are per machine.
+- **Messages you type while Claude is working** are delivered into the running turn, so they still go through at the cap, like the rest of the work in flight. The wrap-up note asks Claude to finish up.
+- **`/5h set hours`** applies from the next block; the running block keeps its end time.
 - When you hit Anthropic's **real** limit, Claude Code's own wait-and-resume (since v2.1.234) takes over. The mod doesn't interfere with it.
 
 ## Privacy and security

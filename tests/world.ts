@@ -30,6 +30,8 @@ export type World = {
   spawned: string[]
   /** Usage the next model request reports. */
   nextUsage: Record<string, number> | undefined
+  /** Usage every model request reports while set (parallel steps). */
+  stickyUsage: Record<string, number> | undefined
   setLimits(list: RateLimit[] | 'throw'): void
   /** Every later `$.store.get` throws, as with a corrupt or locked store. */
   breakStore(): void
@@ -50,6 +52,7 @@ export function world(on: On, o: WorldOptions = {}): World {
     notifications: [],
     spawned: [],
     nextUsage: undefined,
+    stickyUsage: undefined,
     setLimits(list) {
       limits = list
     },
@@ -90,8 +93,9 @@ export function world(on: On, o: WorldOptions = {}): World {
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('turn.step', async function* ($, e) {
-    const usage = w.nextUsage
-      ? { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...w.nextUsage, model: 'claude-test' }
+    const u = w.stickyUsage ?? w.nextUsage
+    const usage = u
+      ? { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...u, model: 'claude-test' }
       : null
     w.nextUsage = undefined
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as never
