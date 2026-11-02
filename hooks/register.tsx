@@ -23,6 +23,7 @@ const KEY_OVERRIDES = 'overrides'
 const KEY_CALIBRATION = 'calibration'
 const KEY_TOK = 'tok:'
 const KEY_NOTIFIED = 'notified'
+const KEY_TRACK = 'weeklyTrack'
 const REFRESH_MS = 30_000
 const STALE_COUNTER_MS = 24 * 3_600_000
 const HOUR = 3_600_000
@@ -95,11 +96,28 @@ async function writeBlock($: $T, mine: L.Block, now: number, limits: L.Limits | 
   return merged
 }
 
-async function readTokens($: $T, blockStart: number): Promise<number> {
+async function readCounters($: $T): Promise<(L.TokenCounter | undefined)[]> {
   const keys = (await $.store.keys()).filter(k => k.startsWith(KEY_TOK))
   const counters: (L.TokenCounter | undefined)[] = []
   for (const k of keys) counters.push(await getJSON<L.TokenCounter>($, k))
-  return L.sumTokens(counters, blockStart)
+  return counters
+}
+
+/** Moves the shared weekly tracker on; a clean tick-to-tick sample teaches the ratio. */
+async function track($: $T, limits: L.Limits | undefined, total: number, calibration: L.Calibration | undefined): Promise<{ track: L.WeeklyTrack | undefined; calibration: L.Calibration | undefined }> {
+  const stored = await getJSON<L.WeeklyTrack>($, KEY_TRACK)
+  if (!limits?.sevenDay) return { track: stored, calibration }
+  const t = L.trackWeekly(stored, limits.sevenDay.pct, limits.sevenDay.resetsAt, total)
+  if (t.track !== stored) await $.store.set(KEY_TRACK, t.track)
+  let learned = calibration
+  if (t.sample) {
+    const next = L.calibrate(calibration, t.sample)
+    if (next && next !== calibration) {
+      learned = next
+      await $.store.set(KEY_CALIBRATION, next)
+    }
+  }
+  return { track: t.track, calibration: learned }
 }
 
 /**
@@ -137,21 +155,18 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
   const control = (await getJSON<L.Control>($, KEY_CONTROL)) ?? {}
   const stored = await getJSON<L.Block>($, KEY_BLOCK)
   const isIdle = !L.isActive(stored, now) && !start
-  let block = L.ensureBlock(stored, now, cfg, limits)
-  const tokens = isIdle ? 0 : await readTokens($, block.startedAt)
-  let calibration = await getJSON<L.Calibration>($, KEY_CALIBRATION)
+  const counters = await readCounters($)
+  const total = L.sumTotals(counters)
+  const fresh = L.liveLimits(limits, now, cfg)
+  // The tracker follows the week even between blocks.
+  const followed = await track($, fresh, total, await getJSON<L.Calibration>($, KEY_CALIBRATION))
+  const calibration = followed.calibration
+  const ratio = calibration?.tokensPerPct ?? L.DEFAULT_TOKENS_PER_WEEKLY_PCT
+  let block = L.ensureBlock(stored, now, cfg, limits, L.weeklyPosition(followed.track, total, ratio))
+  const tokens = isIdle ? 0 : L.sumTokens(counters, block.startedAt)
   if (!isIdle) {
-    const fresh = L.liveLimits(limits, now, cfg)
     if (fresh?.sevenDay && fresh.at >= block.startedAt - L.BASELINE_MAX_AGE_MS) {
-      const seen = L.observeWeekly(block, fresh.sevenDay.pct, tokens, fresh.sevenDay.resetsAt)
-      block = seen.block
-      if (seen.sample) {
-        const learned = L.calibrate(calibration, seen.sample)
-        if (learned && learned !== calibration) {
-          calibration = learned
-          await $.store.set(KEY_CALIBRATION, learned)
-        }
-      }
+      block = L.observeWeekly(block, fresh.sevenDay.pct, tokens, fresh.sevenDay.resetsAt, ratio).block
     }
     block = await writeBlock($, L.healBlock(block, limits), now, limits)
   }

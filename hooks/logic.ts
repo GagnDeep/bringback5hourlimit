@@ -259,27 +259,61 @@ export type Block = {
   stepExact?: boolean
   /** The weekly window's reset time when `weeklyLast` was read. */
   weeklyResetsAt?: number
+  /**
+   * How far into the current whole weekly point the week was at `stepTokens`
+   * (0..0.95): known at a block start from the weekly tracker, 0 after a tick.
+   */
+  stepFrac?: number
+  /**
+   * Where the week stood when the block began (whole points + the tracker's
+   * fraction), from a reading too old to anchor the baseline directly. Used to
+   * settle a late baseline without charging the block for usage elsewhere.
+   */
+  weeklyPrior?: { pos: number; resetsAt?: number }
 }
+
+/** Where the week stands now, from the shared weekly tracker. */
+export type WeeklyPosition = { pct: number; frac: number; resetsAt?: number }
 
 export function isActive(block: Block | undefined, now: number): block is Block {
   return !!block && now >= block.startedAt && now < block.endsAt
 }
 
-export function startBlock(now: number, cfg: Config, weeklyPct?: number): Block {
+export function startBlock(now: number, cfg: Config, weeklyPct?: number, frac = 0): Block {
   const b: Block = { startedAt: now, endsAt: now + cfg.windowHours * HOUR, weeklyCarried: 0 }
   if (weeklyPct !== undefined) {
-    b.weeklyBase = weeklyPct
+    const f = clampFrac(frac)
+    b.weeklyBase = weeklyPct + f
     b.weeklyLast = weeklyPct
+    b.stepTokens = 0
+    b.stepFrac = f
   }
   return b
 }
 
-/** The active block, or a new one started now. */
-export function ensureBlock(block: Block | undefined, now: number, cfg: Config, limits?: Limits): Block {
+function clampFrac(f: number): number {
+  return Number.isFinite(f) ? Math.min(0.95, Math.max(0, f)) : 0
+}
+
+/**
+ * The active block, or a new one started now. Its baseline is a reading at
+ * most 15 minutes old, plus how far into that whole point the week was (the
+ * tracker's fraction, when it tracks the same point). Without such a reading,
+ * the tracker's last position is kept as a prior for the late baseline.
+ */
+export function ensureBlock(block: Block | undefined, now: number, cfg: Config, limits?: Limits, position?: WeeklyPosition): Block {
   if (isActive(block, now)) return block
   const live = liveLimits(limits, now, cfg)
-  const weekly = live && now - live.at <= BASELINE_MAX_AGE_MS ? live.sevenDay?.pct : undefined
-  return startBlock(now, cfg, weekly)
+  const weekly = live && now - live.at <= BASELINE_MAX_AGE_MS ? live.sevenDay : undefined
+  if (weekly) {
+    const same = position && position.pct === weekly.pct && (position.resetsAt === undefined || weekly.resetsAt === undefined || sameWindow({ pct: 0, resetsAt: position.resetsAt }, { pct: 0, resetsAt: weekly.resetsAt }))
+    return startBlock(now, cfg, weekly.pct, same ? position.frac : 0)
+  }
+  const b = startBlock(now, cfg)
+  if (position && !(position.resetsAt !== undefined && position.resetsAt <= now)) {
+    b.weeklyPrior = { pos: position.pct + clampFrac(position.frac), ...(position.resetsAt !== undefined ? { resetsAt: position.resetsAt } : {}) }
+  }
+  return b
 }
 
 /**
@@ -302,6 +336,9 @@ export function mergeBlock(a: Block | undefined, b: Block | undefined, now: numb
   const later = (A.stepTokens ?? -1) >= (B.stepTokens ?? -1) ? A : B
   if (later.stepTokens !== undefined) out.stepTokens = later.stepTokens
   if (later.stepExact) out.stepExact = true
+  if (later.stepFrac !== undefined) out.stepFrac = later.stepFrac
+  const prior = [A.weeklyPrior, B.weeklyPrior].filter((x): x is NonNullable<Block['weeklyPrior']> => x !== undefined)
+  if (prior.length) out.weeklyPrior = prior.reduce((m, x) => (x.pos > m.pos ? x : m))
   const resets = [A.weeklyResetsAt, B.weeklyResetsAt].filter((x): x is number => x !== undefined)
   if (resets.length) out.weeklyResetsAt = Math.max(...resets)
   if (base.length) out.weeklyBase = Math.min(...base)
@@ -314,14 +351,14 @@ export type CalibrationSample = { tokens: number; pct: number }
 
 /**
  * Folds a weekly reading into the block (baseline, growth, weekly reset).
- * `tokensNow` is the block's token total, so a rise yields a sample of how
- * many tokens one weekly point took.
+ * `tokensNow` is the block's token total; `tokensPerPct` the learned ratio,
+ * used to settle a late baseline.
  */
-export function observeWeekly(block: Block, pct: number, tokensNow = 0, resetsAt?: number): { block: Block; sample?: CalibrationSample } {
+export function observeWeekly(block: Block, pct: number, tokensNow = 0, resetsAt?: number, tokensPerPct = DEFAULT_TOKENS_PER_WEEKLY_PCT): { block: Block } {
   if (!Number.isFinite(pct)) return { block }
   const at = resetsAt !== undefined && Number.isFinite(resetsAt) ? { weeklyResetsAt: resetsAt } : {}
   if (block.weeklyBase === undefined || block.weeklyLast === undefined) {
-    return { block: { ...block, weeklyBase: pct, weeklyLast: pct, stepTokens: tokensNow, stepExact: false, ...at } }
+    return { block: { ...lateBaseline(block, pct, tokensNow, at.weeklyResetsAt, tokensPerPct), weeklyLast: pct, ...at } }
   }
   const prev: Window = { pct: block.weeklyLast, ...(block.weeklyResetsAt !== undefined ? { resetsAt: block.weeklyResetsAt } : {}) }
   const next: Window = { pct, ...(at.weeklyResetsAt !== undefined ? { resetsAt: at.weeklyResetsAt } : {}) }
@@ -335,20 +372,41 @@ export function observeWeekly(block: Block, pct: number, tokensNow = 0, resetsAt
         weeklyLast: pct,
         stepTokens: tokensNow,
         stepExact: false,
+        stepFrac: 0,
         ...at,
       },
     }
   }
   if (pct > block.weeklyLast) {
-    const rise = pct - block.weeklyLast
-    const tokens = tokensNow - (block.stepTokens ?? 0)
-    const moved = { ...block, weeklyLast: pct, stepTokens: tokensNow, stepExact: true, ...at }
-    return block.stepExact && tokens > 0 ? { block: moved, sample: { tokens, pct: rise } } : { block: moved }
+    return { block: { ...block, weeklyLast: pct, stepTokens: tokensNow, stepExact: true, stepFrac: 0, ...at } }
   }
   // The same or lower inside the same window: a stale copy, nothing to learn.
   // Only a later reset time with usage held (a schedule change) is kept.
   const later = at.weeklyResetsAt !== undefined && (block.weeklyResetsAt === undefined || (pct === block.weeklyLast && at.weeklyResetsAt > block.weeklyResetsAt))
   return { block: later ? { ...block, ...at } : block }
+}
+
+/**
+ * The baseline for a block that began without a recent reading, settled at
+ * its first one (`pct`). With a prior from the same week:
+ * - no whole point passed since: the prior is exact, and the block's tokens
+ *   so far count in the estimate;
+ * - points passed: the block is charged only what its own tokens explain,
+ *   never usage elsewhere.
+ * Without a prior, the reading itself is the baseline.
+ */
+function lateBaseline(block: Block, pct: number, tokensNow: number, resetsAt: number | undefined, ratio: number): Block {
+  const p = block.weeklyPrior
+  const same = p && (p.resetsAt === undefined || resetsAt === undefined || Math.abs(p.resetsAt - resetsAt) <= 60_000)
+  const whole = p ? Math.floor(p.pos + 1e-9) : 0
+  if (p && same && pct === whole) {
+    return { ...block, weeklyBase: p.pos, stepTokens: 0, stepFrac: clampFrac(p.pos - whole), stepExact: false }
+  }
+  if (p && same && pct > whole) {
+    const own = ratio > 0 ? tokensNow / ratio : 0
+    return { ...block, weeklyBase: Math.min(pct, Math.max(p.pos, pct - own)), stepTokens: tokensNow, stepFrac: 0, stepExact: false }
+  }
+  return { ...block, weeklyBase: pct, stepTokens: tokensNow, stepFrac: 0, stepExact: false }
 }
 
 /**
@@ -373,21 +431,67 @@ export function healBlock(block: Block, limits: Limits | undefined): Block {
   // Only a live window (resetting after the block began) can testify.
   if (out.weeklyCarried > 0 && resetsAt !== undefined && resetsAt > out.startedAt && !couldResetInside(out, resetsAt)) {
     const last = Math.max(out.weeklyLast ?? 0, limits?.sevenDay?.pct ?? 0)
-    out = { ...out, weeklyCarried: 0, weeklyBase: out.weeklyBase && out.weeklyBase > 0 ? Math.min(out.weeklyBase, last) : last, weeklyLast: last, stepExact: false }
+    out = { ...out, weeklyCarried: 0, weeklyBase: out.weeklyBase && out.weeklyBase > 0 ? Math.min(out.weeklyBase, last) : last, weeklyLast: last, stepExact: false, stepFrac: 0 }
   }
   if (out.weeklyCarried > 100) out = { ...out, weeklyCarried: 100 }
   if (!Number.isFinite(out.weeklyCarried) || out.weeklyCarried < 0) out = { ...out, weeklyCarried: 0 }
   return out
 }
 
-export type Calibration = { tokensPerPct: number; samples: number }
+export type Calibration = { tokensPerPct: number; samples: number; recent?: number[] }
 
-/** Learns tokens-per-weekly-point from a sample (a moving average). */
+const CALIBRATION_WINDOW = 7
+
+/**
+ * Learns tokens-per-weekly-point: the median of the last few samples, so a
+ * tick caused by usage elsewhere (claude.ai, another machine), which makes a
+ * point look cheap, is outvoted instead of dragging the average.
+ */
 export function calibrate(prev: Calibration | undefined, sample: CalibrationSample): Calibration | undefined {
-  if (sample.pct <= 0 || sample.tokens < 10_000) return prev
+  if (!(sample.pct > 0) || !(sample.tokens >= 10_000)) return prev
   const r = Math.min(1e10, Math.max(1e4, sample.tokens / sample.pct))
-  if (!prev) return { tokensPerPct: Math.round(r), samples: 1 }
-  return { tokensPerPct: Math.round(prev.tokensPerPct * 0.6 + r * 0.4), samples: prev.samples + 1 }
+  const before = prev ? (prev.recent?.length ? prev.recent : [prev.tokensPerPct]) : []
+  const recent = [...before, Math.round(r)].slice(-CALIBRATION_WINDOW)
+  return { tokensPerPct: Math.round(median(recent)), samples: (prev?.samples ?? 0) + 1, recent }
+}
+
+function median(xs: readonly number[]): number {
+  const v = [...xs].sort((a, b) => a - b)
+  const m = v.length >> 1
+  return v.length % 2 ? v[m]! : (v[m - 1]! + v[m]!) / 2
+}
+
+/**
+ * The shared weekly tracker: the last whole point seen and the all-sessions
+ * token total when it began. It outlives blocks, so a new block knows how far
+ * into the current point the week already is.
+ */
+export type WeeklyTrack = { pct: number; resetsAt?: number; totalAt: number; exact: boolean }
+
+/**
+ * Folds a reading into the tracker. A rise marks the start of a new point
+ * (`exact`); two exact rises in a row give a calibration sample. A new
+ * window or first sighting starts over; lower readings are stale copies.
+ */
+export function trackWeekly(t: WeeklyTrack | undefined, pct: number, resetsAt: number | undefined, total: number): { track: WeeklyTrack; sample?: CalibrationSample } {
+  const at = resetsAt !== undefined ? { resetsAt } : {}
+  const fresh = (): WeeklyTrack => ({ pct, ...at, totalAt: total, exact: false })
+  if (!t || !Number.isFinite(pct)) return { track: fresh() }
+  const prev: Window = { pct: t.pct, ...(t.resetsAt !== undefined ? { resetsAt: t.resetsAt } : {}) }
+  const next: Window = { pct, ...at }
+  if (isNewWindow(prev, next) || total < t.totalAt) return { track: fresh() }
+  if (pct > t.pct) {
+    const track: WeeklyTrack = { pct, ...at, totalAt: total, exact: true }
+    return t.exact ? { track, sample: { tokens: total - t.totalAt, pct: pct - t.pct } } : { track }
+  }
+  return { track: t }
+}
+
+/** How far into its current whole point the week is now, by local tokens. */
+export function weeklyPosition(t: WeeklyTrack | undefined, total: number, tokensPerPct: number): WeeklyPosition | undefined {
+  if (!t) return undefined
+  const frac = tokensPerPct > 0 ? clampFrac((total - t.totalAt) / tokensPerPct) : 0
+  return { pct: t.pct, frac, ...(t.resetsAt !== undefined ? { resetsAt: t.resetsAt } : {}) }
 }
 
 export function weeklySpent(block: Block): number {
@@ -412,11 +516,16 @@ export function weightedTokens(u: UsageLike | undefined): number {
   )
 }
 
-export type TokenCounter = { blockStart: number; tokens: number; at: number }
+/** One session's tokens: this block's, and its lifetime `total` (never resets). */
+export type TokenCounter = { blockStart: number; tokens: number; at: number; total?: number }
 
 export function addTokens(c: TokenCounter | undefined, blockStart: number, tokens: number, now: number): TokenCounter {
   const base = c && c.blockStart === blockStart ? c.tokens : 0
-  return { blockStart, tokens: base + tokens, at: now }
+  return { blockStart, tokens: base + tokens, at: now, total: (c?.total ?? 0) + tokens }
+}
+
+export function sumTotals(counters: readonly (TokenCounter | undefined)[]): number {
+  return counters.reduce((s, c) => s + (c?.total ?? 0), 0)
 }
 
 export function sumTokens(counters: readonly (TokenCounter | undefined)[], blockStart: number): number {
@@ -440,8 +549,10 @@ export type Status = {
   resetsAt: number
   weeklyPct?: number
   weeklyResetsAt?: number
-  /** Part of `used` estimated from tokens since the weekly % last ticked (weekly). */
+  /** How far into the current whole weekly point the estimate puts the week (weekly). */
   estimated: number
+  /** True when `used` rests partly on a token estimate, not only Anthropic's figures. */
+  isEstimate: boolean
   windowLabel: string
   /** True when the cap applies to new work now. */
   blocks: boolean
@@ -460,6 +571,7 @@ export type EvalInput = {
 export function evaluate(x: EvalInput): Status {
   const { cfg, now, block, limits, tokens, control, calibration } = x
   let estimated = 0
+  let isEstimate = false
   const sel = selectStrategy(cfg, limits, now)
   const fresh = liveLimits(limits, now, cfg)
   const weeklyPct = fresh?.sevenDay?.pct
@@ -472,7 +584,7 @@ export function evaluate(x: EvalInput): Status {
   if (!sel.available) {
     return {
       strategy: sel.strategy, degraded: true, reason: sel.reason, level: 'failing', pct: 0, used: 0,
-      budget: 0, resetsAt, weeklyPct, weeklyResetsAt, estimated, windowLabel, blocks: cfg.failMode === 'closed',
+      budget: 0, resetsAt, weeklyPct, weeklyResetsAt, estimated, isEstimate, windowLabel, blocks: cfg.failMode === 'closed',
     }
   }
   if (sel.strategy === 'official' && fresh?.fiveHour) {
@@ -485,10 +597,18 @@ export function evaluate(x: EvalInput): Status {
   } else if (sel.strategy === 'weekly') {
     // Anthropic reports whole weekly points. Between ticks, estimate from
     // tokens, kept under the next point so it never runs a point ahead.
+    // The week's position = whole points + how far into the current one
+    // (where the step began, plus tokens since); the block's spend is how far
+    // that has moved from where the block began.
     const ratio = calibration?.tokensPerPct ?? DEFAULT_TOKENS_PER_WEEKLY_PCT
-    const since = Math.max(0, tokens - (block.stepTokens ?? 0))
-    estimated = block.weeklyBase === undefined ? 0 : Math.min(0.95, since / ratio)
-    used = weeklySpent(block) + estimated
+    if (block.weeklyBase === undefined || block.weeklyLast === undefined) {
+      used = block.weeklyCarried
+    } else {
+      const since = Math.max(0, tokens - (block.stepTokens ?? 0))
+      estimated = clampFrac((block.stepFrac ?? 0) + since / ratio)
+      used = Math.max(0, block.weeklyCarried + Math.max(0, block.weeklyLast + estimated - block.weeklyBase))
+      isEstimate = estimated > 0.001 || !Number.isInteger(block.weeklyBase)
+    }
     budget = cfg.weeklyBudgetPct
   } else {
     used = tokens
@@ -500,7 +620,7 @@ export function evaluate(x: EvalInput): Status {
   else if (control.unlockedBlock !== undefined && control.unlockedBlock === block.startedAt) level = 'unlocked'
   return {
     strategy: sel.strategy, degraded: sel.degraded, reason: sel.reason, level, pct, used, budget,
-    resetsAt, weeklyPct, weeklyResetsAt, estimated, windowLabel, blocks: level === 'cap',
+    resetsAt, weeklyPct, weeklyResetsAt, estimated, isEstimate: isEstimate || (sel.strategy === 'tokens' && sel.degraded), windowLabel, blocks: level === 'cap',
   }
 }
 
@@ -603,7 +723,7 @@ export type Segment = { text: string; tone: Tone }
 export function bandData(s: Status, now: number, cfg: Config, idle: boolean, control: Control): BandData {
   const d: BandData = {
     level: s.level, pct: s.pct, resetsAt: s.resetsAt, now, idle: idle && s.strategy !== 'official',
-    isEstimate: (s.strategy === 'tokens' && s.degraded) || (s.strategy === 'weekly' && s.estimated > 0.001),
+    isEstimate: s.isEstimate,
     windowLabel: s.windowLabel,
     failMode: cfg.failMode, timeZone: cfg.timeZone,
   }
@@ -824,7 +944,7 @@ export function applySet(overrides: Raw, key: keyof Config, value: string): { ov
 export function statusText(s: Status, cfg: Config, now: number, block: Block, control: Control, invalid: string[], idle = false): string {
   const tz = cfg.timeZone
   const W = s.windowLabel
-  const pctText = `${s.estimated > 0.001 || (s.strategy === 'tokens' && s.degraded) ? '≈' : ''}${Math.floor(s.pct)}%`
+  const pctText = `${s.isEstimate ? '≈' : ''}${Math.floor(s.pct)}%`
   const headline: Record<Level, string> = {
     ok: `${pctText} used`,
     warn: `${pctText} used, close to the limit`,
@@ -841,12 +961,15 @@ export function statusText(s: Status, cfg: Config, now: number, block: Block, co
   } else if (s.strategy === 'weekly') {
     lines.push(`  Measured as: a share of your weekly limit. Each ${W} block may use ${trimNum(cfg.weeklyBudgetPct)}% of your week;`)
     lines.push(
-      s.estimated > 0.001
-        ? `    this block has used ≈${round1(s.used)}% of your week (${round1(s.used - s.estimated)}% reported + ≈${round1(s.estimated)}% estimated from tokens,`
+      s.isEstimate
+        ? `    this block has used ≈${round1(s.used)}% of your week.`
         : `    this block has used ${round1(s.used)}% of your week.`,
     )
-    if (s.estimated > 0.001) lines.push('    since Anthropic reports whole weekly points). Change: /5h set budget <percent>')
-    else lines.push('    Change: /5h set budget <percent>')
+    if (s.isEstimate) {
+      const week = s.weeklyPct !== undefined ? ` (Anthropic: ${trimNum(s.weeklyPct)}%, the mod: ≈${round1(s.weeklyPct + s.estimated)}%)` : ''
+      lines.push(`    Anthropic reports whole weekly points; the mod fills in between from your tokens${week}.`)
+    }
+    lines.push('    Change: /5h set budget <percent>')
   } else if (s.strategy === 'official') {
     lines.push(`  Measured as: Anthropic's own 5-hour limit, paused at ${trimNum(cfg.officialCapPct)}% of it (now ${round1(s.used)}%).`)
     lines.push('    Change: /5h set cap <percent>')

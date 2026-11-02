@@ -54,9 +54,11 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 `mode` lets the person budget by tokens instead of percent (`mode=tokens`), and `windowHours` changes the block length (e.g. a 3 h or 8 h block).
 
 ### Detection details
-- **Whole points.** Anthropic reports `percentUsed` in whole points in practice. Between ticks, the weekly spend gets `+ min(0.95, tokensSinceTick / tokensPerPct)`.
-  - `tokensPerPct` is learned (moving average, stored as `calibration`) from tick-to-tick intervals only (`stepExact`), never from the partial first tick after a baseline.
+- **Whole points.** Anthropic reports `percentUsed` in whole points in practice. The week's position is modelled as `whole point + min(0.95, fraction)`, where the fraction is how far into the point it was at the last step (`stepFrac`) plus `tokensSinceStep / tokensPerPct`. A block's spend is how far that position moved from the block's baseline: `carried + max(0, last + fraction − base)`.
+  - **Weekly tracker** (`weeklyTrack` in the store): the last whole point seen and the all-sessions lifetime token total (`total` on each `tok:` counter) when it began. It outlives blocks, so a new block's baseline is `whole + fraction` (e.g. 57.4), not the bare whole number that charged a full point at the first tick.
+  - `tokensPerPct` is learned from the tracker's tick-to-tick intervals only (never the first tick after a sighting, which is partial), as the **median of the last 7 samples** (`calibration.recent`): a tick caused by usage elsewhere makes a point look cheap and is outvoted.
   - The default prior is 4M weighted tokens per point.
+- **Late baseline.** With no reading under 15 minutes old at block start, the tracker's position is kept as `weeklyPrior`. At the first reading: still on that point, the prior is the baseline and the block's tokens so far count; points later, the baseline is `max(prior, reading − ownTokens/tokensPerPct)`, so the block is charged only what its own tokens explain, never usage elsewhere.
 - **Per request.** Tokens are counted at `turn.step` (each model request), not at `turn.complete`.
 - **Freshness.** A `session.measure` reading is always fresh. A polled `$.session.usage()` reading is stored only when its figures differ from what's stored.
 - **Baselines.** A new block's baseline comes only from a reading under 15 minutes old (`BASELINE_MAX_AGE_MS`).

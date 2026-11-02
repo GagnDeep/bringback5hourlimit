@@ -195,18 +195,64 @@ describe('strategies', () => {
     expect(L.weeklySpent(b)).toBe(3.5)
   })
 
-  test('calibration ignores the first tick after a baseline and noise', async () => {
-    let b = L.startBlock(T0, cfg())
-    let r = L.observeWeekly(b, 40, 0)
-    expect(r.block.stepExact).toBe(false)
-    r = L.observeWeekly(r.block, 41, 500_000)
-    expect(r.sample).toBe(undefined)
-    expect(r.block.stepExact).toBe(true)
-    r = L.observeWeekly(r.block, 43, 4_500_000)
-    expect(r.sample).toEqual({ tokens: 4_000_000, pct: 2 })
-    expect(L.calibrate(undefined, r.sample!)).toEqual({ tokensPerPct: 2_000_000, samples: 1 })
+  test('tracker: learns only tick to tick, never from a first sighting; median shrugs off outliers', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    let t = L.trackWeekly(undefined, 40, R, 0)
+    expect(t.track.exact).toBe(false)
+    t = L.trackWeekly(t.track, 41, R, 500_000) // first tick after sighting: partial point
+    expect(t.sample).toBe(undefined)
+    expect(t.track.exact).toBe(true)
+    expect(L.trackWeekly(t.track, 40, R, 600_000).track).toBe(t.track) // stale copy
+    t = L.trackWeekly(t.track, 43, R, 4_500_000)
+    expect(t.sample).toEqual({ tokens: 4_000_000, pct: 2 })
+    let c = L.calibrate(undefined, t.sample!)
+    expect(c).toEqual({ tokensPerPct: 2_000_000, samples: 1, recent: [2_000_000] })
     expect(L.calibrate(undefined, { tokens: 5, pct: 1 })).toBe(undefined)
-    expect(L.calibrate({ tokensPerPct: 2_000_000, samples: 1 }, { tokens: 1_000_000, pct: 1 })).toEqual({ tokensPerPct: 1_600_000, samples: 2 })
+    c = L.calibrate(c, { tokens: 2_200_000, pct: 1 })
+    c = L.calibrate(c, { tokens: 20_000, pct: 1 }) // a tick caused by usage elsewhere
+    expect(c?.tokensPerPct).toBe(2_000_000)
+    // An old-format calibration is carried over.
+    expect(L.calibrate({ tokensPerPct: 3_000_000, samples: 4 }, { tokens: 1_000_000, pct: 1 })?.recent).toEqual([3_000_000, 1_000_000])
+    // A new window starts over.
+    expect(L.trackWeekly(t.track, 1, R + 7 * 24 * HOUR, 5_000_000).track).toEqual({ pct: 1, resetsAt: R + 7 * 24 * HOUR, totalAt: 5_000_000, exact: false })
+  })
+
+  test('a new block starts partway into the current point, from the tracker', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    const pos = L.weeklyPosition({ pct: 57, resetsAt: R, totalAt: 1_000_000, exact: true }, 2_600_000, 4_000_000)
+    expect(pos).toEqual({ pct: 57, frac: 0.4, resetsAt: R })
+    const b = L.ensureBlock(undefined, T0, cfg(), ultra(57, T0), pos)
+    expect(b.weeklyBase).toBe(57.4)
+    expect(b.stepFrac).toBe(0.4)
+    // At the next tick the block has spent 0.6 of a point, not a whole one.
+    const ticked = L.observeWeekly(b, 58, 2_400_000, R).block
+    const s = L.evaluate({ cfg: cfg(), now: T0 + HOUR, block: ticked, limits: ultra(58, T0 + HOUR), tokens: 2_400_000, control: {} })
+    expect(Math.abs(s.used - 0.6) < 1e-6).toBe(true)
+    // Before it, 1M tokens moved the week from 57.4 to 57.65.
+    const mid = L.evaluate({ cfg: cfg(), now: T0 + HOUR, block: b, limits: ultra(57, T0 + HOUR), tokens: 1_000_000, control: {} })
+    expect(Math.abs(mid.used - 0.25) < 1e-6).toBe(true)
+    expect(mid.isEstimate).toBe(true)
+    // A tracker on another point (a tick it hasn't seen) gives no fraction.
+    expect(L.ensureBlock(undefined, T0, cfg(), ultra(58, T0), pos).weeklyBase).toBe(58)
+  })
+
+  test('late baseline: the block is charged only what its own tokens explain', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    const prior: L.WeeklyPosition = { pct: 57, frac: 0.2, resetsAt: R }
+    const start = L.ensureBlock(undefined, T0, cfg(), ultra(57, T0 - HOUR), prior) // reading an hour old
+    expect(start.weeklyBase).toBe(undefined)
+    expect(start.weeklyPrior).toEqual({ pos: 57.2, resetsAt: R })
+    // Still on point 57: the prior is the baseline; the block's tokens count.
+    const same = L.observeWeekly(start, 57, 800_000, R, 4_000_000).block
+    expect(same.weeklyBase).toBe(57.2)
+    const s1 = L.evaluate({ cfg: cfg(), now: T0 + HOUR, block: same, limits: ultra(57, T0 + HOUR), tokens: 800_000, control: {} })
+    expect(Math.abs(s1.used - 0.2) < 1e-6).toBe(true)
+    // Three points later (others used the account): only the block's own 0.2 is charged.
+    const jumped = L.observeWeekly(start, 60, 800_000, R, 4_000_000).block
+    expect(Math.abs((jumped.weeklyBase ?? 0) - 59.8) < 1e-6).toBe(true)
+    // Up one point and the block's tokens explain most of it: charged that.
+    const own = L.observeWeekly(start, 58, 3_000_000, R, 4_000_000).block
+    expect(Math.abs((own.weeklyBase ?? 0) - 57.25) < 1e-6).toBe(true)
   })
 
   test('liveLimits drops windows past their reset and stale snapshots', async () => {

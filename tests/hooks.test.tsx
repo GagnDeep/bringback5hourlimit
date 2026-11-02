@@ -189,7 +189,8 @@ describe('detection', () => {
     await step($, w, { output_tokens: 1_000_000 }) // 0.25 of a point at the 4M prior
     let s = (await $.command.run(cmd('status'))).text ?? ''
     expect(s).toMatch(/^5h limit: ≈1% used/) // 0.25 of a point / 15
-    expect(s).toMatch(/used ≈0\.3% of your week \(0% reported \+ ≈0\.3% estimated from tokens/)
+    expect(s).toMatch(/used ≈0\.3% of your week\./)
+    expect(s).toMatch(/Anthropic: 40%, the mod: ≈40\.3%/)
     await step($, w, { output_tokens: 50_000_000 })
     s = (await $.command.run(cmd('status'))).text ?? ''
     expect(s).toMatch(/^5h limit: ≈6% used/) // capped at 0.95 of a point
@@ -207,10 +208,31 @@ describe('detection', () => {
     await step($, w, { output_tokens: 2_000_000 })
     w.setLimits(ULTRA(42))
     await $.session.measure(measureInput(ULTRA(42))) // a whole point took 2M
-    expect(w.store.get('calibration')).toEqual({ tokensPerPct: 2_000_000, samples: 1 })
+    expect(w.store.get('calibration')).toEqual({ tokensPerPct: 2_000_000, samples: 1, recent: [2_000_000] })
     await step($, w, { output_tokens: 1_000_000 })
     const s = (await $.command.run(cmd('status'))).text ?? ''
-    expect(s).toMatch(/2% reported \+ ≈0\.5% estimated/) // 1M at the learned 2M per point
+    expect(s).toMatch(/the mod: ≈42\.5%/) // 1M at the learned 2M per point
+  })
+
+  test('the next block starts where the week really is inside its point, not at the whole number', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('a'))
+    await step($, w, { output_tokens: 1_000_000 })
+    w.setLimits(ULTRA(41))
+    await $.session.measure(measureInput(ULTRA(41))) // point 41 starts here
+    await step($, w, { output_tokens: 1_000_000 }) // a quarter of point 41 at the 4M prior
+    await w.clock.advance(5 * HOUR + MIN)
+    await $.session.measure(measureInput(ULTRA(41)))
+    await $.prompt.submit(prompt('next block'))
+    const b = w.store.get('block') as { startedAt: number; weeklyBase: number }
+    expect(b.startedAt).toBe(T0 + 5 * HOUR + MIN)
+    expect(b.weeklyBase).toBe(41.25)
+    // The tick to 42 then costs this block three quarters of a point, not a whole one.
+    await step($, w, { output_tokens: 3_000_000 })
+    w.setLimits(ULTRA(42))
+    await $.session.measure(measureInput(ULTRA(42)))
+    expect(((await $.command.run(cmd('status'))).text ?? '')).toMatch(/used ≈0\.8% of your week/)
   })
 
   test('an unchanged polled reading does not pass as fresh after a long idle', async ($, on) => {

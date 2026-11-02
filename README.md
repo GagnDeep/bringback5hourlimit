@@ -73,7 +73,8 @@ In `auto` mode the mod uses the first of these that's available:
 1. **Anthropic's 5-hour window (`official`).** This applies to Max, Pro and unverified Ultra accounts. If Anthropic still reports a 5-hour %, the cap is `officialCapPct` of it, and the reset time is Anthropic's.
 2. **Share of your week (`weekly`).** This applies to verified Ultra accounts, which only report a weekly window. When a block starts, the mod records your weekly %. What the block has spent is how much your weekly % has risen since then. When that rise reaches `weeklyBudgetPct`, you're capped. This uses Anthropic's own units, and it handles the weekly reset happening partway through a block.
    - Anthropic reports the weekly % in **whole points**, so between ticks the mod estimates progress from tokens, shown with `≈`.
-   - It learns how many tokens one weekly point takes by watching ticks. It never learns from the first tick after a block starts, because that one is partial.
+   - It learns how many tokens one weekly point takes by watching the week tick from point to point (the median of recent ticks, so a tick caused by claude.ai or another machine doesn't skew it).
+   - A block starts where your week really is inside its point (e.g. 57.4%, not 57%), so the first tick doesn't charge it a whole point.
    - The estimate always stays under the next real point, so it can't run ahead of Anthropic's number by more than one point.
 3. **Local token count (`tokens`).** This is used when there's no usage data, e.g. offline, on API keys, or if the API changes. The mod counts tokens from every model request, subagents included, on this machine. Cache reads count at 10%.
 
@@ -97,7 +98,7 @@ You can also force one of these with `mode`. For example, `/5h set mode tokens` 
 - **This is local only.** The mod can't change Anthropic's limits, and it doesn't try to. It only refuses work on your own machine.
 - **The weekly-% budget is an estimate.** Anthropic never published the old ratio between the 5-hour and weekly limits, so the default of 15% of weekly is a judgement call. Change it if it doesn't suit you.
 - **It relies on the Claude Code mods API**, which is early access and may change. If the usage data disappears, the mod falls back to counting tokens and says so in the bar.
-- **The weekly % only updates when Anthropic reports it**, in whole points, with each response. Between points the bar is an estimate (`≈`) until the mod has learned your token-to-point ratio.
+- **The weekly % only updates when Anthropic reports it**, in whole points, with each response. Between points the bar is an estimate (`≈`), and it's rougher until the mod has seen your week tick a couple of times. Usage on claude.ai or another machine shows up at the next whole point.
 - **Across machines** only the weekly % is shared, because it's account-wide. The block timer, `/5h off` and `/5h unlock` are per machine.
 - When you hit Anthropic's **real** limit, Claude Code's own wait-and-resume (since v2.1.234) takes over. The mod doesn't interfere with it.
 
