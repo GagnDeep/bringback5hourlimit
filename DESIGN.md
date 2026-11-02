@@ -40,8 +40,8 @@ Invalid values fall back to the next layer down and are reported in `/5h status`
    - At block start the mod records `weeklyBase` = the latest weekly %.
    - spent = `weeklyCarried + (weeklyLast − weeklyBase)`.
    - If weekly % drops (the weekly window reset mid-block), the spend so far is carried and the baseline is reset to 0.
-   - A drop only counts as a reset when the window's reset time moved on by over an hour and the new window began after the block did. Any other dip is a stale copy (another Claude Code process still holding an older cached reading) and is ignored.
-   - Saved readings never go down inside one window: a lower % for the same reset time loses to the higher one, whichever was written last.
+   - A drop only counts as a reset when usage fell, the window's reset time moved on by over an hour, and the new window began after the block did. A reset time that moves while usage holds or grows is a schedule change. Any other dip is a stale copy (another Claude Code process still holding an older cached reading) and is ignored.
+   - Saved readings never go down inside one window: a lower % for the same reset time loses to the higher one, whichever was written last. A copy of a window that had already ended (an idle process's last-window figures) never replaces a live one.
    - `healBlock` repairs any block that carries spend from a reset that can't have happened (written by an older version or a process still running one), and caps carried spend at 100.
    - If no weekly reading exists at block start, the baseline is taken at the first reading inside the block.
    - Budget = `weeklyBudgetPct`. The default of 15 is roughly 6–7 full blocks a week. It is **not** Anthropic's old ratio.
@@ -82,8 +82,8 @@ A snapshot is "fresh" if it was taken within `max(windowHours, 5)` hours. Snapsh
 | `ok` | otherwise |
 
 - **Prompts** (`prompt.submit`): at `cap`, `{ drop }` with a message giving the reset time in the local zone and the override commands.
-  - Never dropped: slash commands (so `/5h` always works), `isMeta` rows, and origins `task-notification`, `observer`, `observer-activity`, `unclassified`. This avoids agent-usage-guard's "swallowed notifications" failure.
-- **Agents** (`agent.spawn`, including resumes): at `cap`, `{ deny }`.
+  - Never dropped: slash commands (so `/5h` always works), `isMeta` rows, anything delivered into a running turn (`turnId` set), and origins `task-notification`, `peer-send-message`, `observer`, `observer-activity`, `unclassified`. This avoids agent-usage-guard's "swallowed notifications" failure.
+- **Agents** (`agent.spawn`): new agents at `cap` get `{ deny }`. Resumes (`e.resume`, a SendMessage waking a parked subagent) pass: they continue work already running.
 - **In-flight work** is never killed and tool calls are never refused.
   - When the cap is reached mid-turn (seen on `session.measure`, `turn.complete` or `tool.call`), the mod appends one hidden user note per loop per block via `$.session.append`: *finish the current step, leave files consistent, start nothing large, summarize what's left*.
 - **Warning:**

@@ -1,6 +1,6 @@
 {
   "name": "bringback5hourlimit",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Bring back the 5-hour usage limit as a local, self-imposed rolling cap for Claude Code (works on verified Ultra, Max, Pro, and offline).",
   "author": {
     "name": "GagnDeep"

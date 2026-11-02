@@ -22,6 +22,7 @@ const KEY_CONTROL = 'control'
 const KEY_OVERRIDES = 'overrides'
 const KEY_CALIBRATION = 'calibration'
 const KEY_TOK = 'tok:'
+const KEY_NOTIFIED = 'notified'
 const REFRESH_MS = 30_000
 const STALE_COUNTER_MS = 24 * 3_600_000
 const HOUR = 3_600_000
@@ -185,7 +186,11 @@ async function react($: $T, ctx: Ctx, snap: Snapshot): Promise<void> {
       `${s.windowLabel} budget spent · new prompts and agents paused until ${L.formatClock(s.resetsAt, cfg.timeZone, now)} · /5h unlock to override`,
       { timeoutMs: 12000 },
     )
-    await $.ui.notify(`${s.windowLabel} budget spent. Resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}.`, { title: 'bringback5hourlimit' }).catch(() => undefined)
+    // One desktop notification per block, however many sessions are open.
+    if ((await getJSON<number>($, KEY_NOTIFIED)) !== block.startedAt) {
+      await $.store.set(KEY_NOTIFIED, block.startedAt)
+      await $.ui.notify(`${s.windowLabel} budget spent. Resets ${L.formatReset(s.resetsAt, now, cfg.timeZone)}.`, { title: 'bringback5hourlimit' }).catch(() => undefined)
+    }
   }
   if (s.level === 'failing' && !ctx.toasted.has(`${id}:failing`)) {
     ctx.toasted.add(`${id}:failing`)
@@ -256,10 +261,11 @@ async function countUsage($: $T, ctx: Ctx, usage: L.UsageLike | undefined): Prom
   await react($, ctx, await snapshot($, ctx, false))
 }
 
-async function onToolCall($: $T, ctx: Ctx, s: L.Status, agentId: string | undefined): Promise<void> {
-  const now = await $.clock.now()
-  const block = await getJSON<L.Block>($, KEY_BLOCK)
-  if (L.isActive(block, now)) await note($, ctx, s, now, ctx.lastCfg, block, agentId)
+async function onToolCall($: $T, ctx: Ctx, agentId: string | undefined): Promise<void> {
+  // The cached status can be up to a tick old (an unlock or /5h off in another
+  // session): confirm before telling the model to wrap up.
+  const snap = await snapshot($, ctx, false)
+  if (!snap.isIdle && snap.status.level === 'cap') await note($, ctx, snap.status, snap.now, snap.cfg, snap.block, agentId)
 }
 
 async function guardPrompt($: $T, ctx: Ctx): Promise<string | undefined> {
@@ -272,6 +278,10 @@ async function guardPrompt($: $T, ctx: Ctx): Promise<string | undefined> {
 async function guardAgent($: $T, ctx: Ctx): Promise<string | undefined> {
   const snap = await snapshot($, ctx, true)
   return snap.status.blocks ? L.refusalText(snap.status, snap.now, snap.cfg.timeZone, 'agent') : undefined
+}
+
+function FAIL_CLOSED_TEXT(what: string): string {
+  return `bringback5hourlimit: ${what}: the usage check failed and fail mode is "closed". Try /5h off; if that fails too, set "Fail mode" to open in /config or BB5H_FAIL_MODE=open.`
 }
 
 function failOpenWarn($: $T, what: string): void {
@@ -378,7 +388,7 @@ export const register: Register = (on, options) => {
   // Observe only: work running past the cap gets the wrap-up note once.
   on('tool.call', async ($, e, next) => {
     const s = ctx.lastStatus
-    if (s?.level === 'cap') await onToolCall($, ctx, s, e.agentId).catch(err => logError($, err))
+    if (s?.level === 'cap') await onToolCall($, ctx, e.agentId).catch(err => logError($, err))
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -389,23 +399,33 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => {
     if (next.called) return next(e)
     if (ctx.lastCfg.failMode === 'closed') {
-      return { drop: 'bringback5hourlimit: the usage check failed and fail mode is "closed". /5h off to pause.' }
+      return { drop: FAIL_CLOSED_TEXT('Prompt not sent') }
     }
     failOpenWarn($, 'prompt')
     return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
+    // Waking a parked subagent (SendMessage) continues work already running.
+    if (e.resume) return next(e)
     const refusal = await guardAgent($, ctx)
     return refusal ? { deny: refusal } : next(e)
   }).catch(($, e, next) => {
     if (next.called) return next(e)
-    if (ctx.lastCfg.failMode === 'closed') return { deny: 'bringback5hourlimit: the usage check failed and fail mode is "closed".' }
+    if (ctx.lastCfg.failMode === 'closed') return { deny: FAIL_CLOSED_TEXT('New agent not started') }
     failOpenWarn($, 'agent')
     return next(e)
   })
 
-  on('command.run', { command: '5h' }, async ($, e) => ({ text: await runCommand($, ctx, e.args) }))
+  on('command.run', { command: '5h' }, async ($, e) => {
+    try {
+      return { text: await runCommand($, ctx, e.args) }
+    } catch (err) {
+      logError($, err)
+      const why = err instanceof Error ? err.message : String(err)
+      return { text: `bringback5hourlimit: /5h failed (${why}). Its saved state may be unreadable. To pause the cap anyway, set "Fail mode" to open in /config or BB5H_FAIL_MODE=open, or disable the mod.` }
+    }
+  })
 
   // Observe only: the mode labels share the hint row, so their width is
   // what the bar must leave room for.

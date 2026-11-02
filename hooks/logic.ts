@@ -155,8 +155,14 @@ export function mergeLimits(a: Limits | undefined, b: Limits | undefined): Limit
   const [older, newer] = b.at >= a.at ? [a, b] : [b, a]
   // Inside one window usage only grows. A lower figure for the same window is
   // a stale copy (another process's cached reading), so the higher one stands.
-  const keep = (o: Window | undefined, n: Window | undefined): Window | undefined =>
-    o && n && sameWindow(o, n) && o.pct > n.pct ? o : n
+  // A reading of a window that had already ended when the other was taken is
+  // also a stale copy (an idle process still holding last week's figures).
+  const ended = (w: Window, at: number) => w.resetsAt !== undefined && w.resetsAt <= at
+  const keep = (o: Window | undefined, n: Window | undefined): Window | undefined => {
+    if (!o || !n) return n
+    if (sameWindow(o, n)) return o.pct > n.pct ? o : n
+    return ended(n, newer.at) && !ended(o, newer.at) ? o : n
+  }
   const fiveHour = keep(older.fiveHour, newer.fiveHour)
   const sevenDay = keep(older.sevenDay, newer.sevenDay)
   if (fiveHour === newer.fiveHour && sevenDay === newer.sevenDay) return newer
@@ -173,11 +179,14 @@ export function sameWindow(a: Window, b: Window): boolean {
 }
 
 /**
- * True when `next` belongs to a later window than `prev`: its reset time moved
- * on by over an hour. Without both reset times, only a fall to under half (by
- * 5+ points) reads as a new window; smaller dips are stale copies.
+ * True when `next` belongs to a later window than `prev`: usage fell and the
+ * reset time moved on by over an hour. Without both reset times, only a fall
+ * to under half (by 5+ points) reads as a new window; smaller dips are stale.
  */
 export function isNewWindow(prev: Window, next: Window): boolean {
+  // A new window starts near empty, so usage must fall. A reset time moving
+  // while usage holds or grows is a schedule change, not a reset.
+  if (next.pct >= prev.pct) return false
   if (prev.resetsAt !== undefined && next.resetsAt !== undefined) return next.resetsAt > prev.resetsAt + HOUR
   return next.pct < prev.pct / 2 && prev.pct - next.pct >= 5
 }
@@ -337,7 +346,9 @@ export function observeWeekly(block: Block, pct: number, tokensNow = 0, resetsAt
     return block.stepExact && tokens > 0 ? { block: moved, sample: { tokens, pct: rise } } : { block: moved }
   }
   // The same or lower inside the same window: a stale copy, nothing to learn.
-  return { block: block.weeklyResetsAt === undefined && at.weeklyResetsAt !== undefined ? { ...block, ...at } : block }
+  // Only a later reset time with usage held (a schedule change) is kept.
+  const later = at.weeklyResetsAt !== undefined && (block.weeklyResetsAt === undefined || (pct === block.weeklyLast && at.weeklyResetsAt > block.weeklyResetsAt))
+  return { block: later ? { ...block, ...at } : block }
 }
 
 /**
@@ -359,7 +370,8 @@ function couldResetInside(block: Block, resetsAt: number | undefined): boolean {
 export function healBlock(block: Block, limits: Limits | undefined): Block {
   let out = block
   const resetsAt = limits?.sevenDay?.resetsAt
-  if (out.weeklyCarried > 0 && resetsAt !== undefined && !couldResetInside(out, resetsAt)) {
+  // Only a live window (resetting after the block began) can testify.
+  if (out.weeklyCarried > 0 && resetsAt !== undefined && resetsAt > out.startedAt && !couldResetInside(out, resetsAt)) {
     const last = Math.max(out.weeklyLast ?? 0, limits?.sevenDay?.pct ?? 0)
     out = { ...out, weeklyCarried: 0, weeklyBase: out.weeklyBase && out.weeklyBase > 0 ? Math.min(out.weeklyBase, last) : last, weeklyLast: last, stepExact: false }
   }
@@ -497,12 +509,14 @@ export function evaluate(x: EvalInput): Status {
 export type OriginLike = { kind: string }
 
 /** Origins that are deliveries of work already running, never new work. */
-const PASS_ORIGINS = new Set(['task-notification', 'observer', 'observer-activity', 'unclassified'])
+const PASS_ORIGINS = new Set(['task-notification', 'peer-send-message', 'observer', 'observer-activity', 'unclassified'])
 
 /** Whether a submitted prompt is new work the cap may refuse. */
-export function isNewWork(e: { command?: unknown; isMeta?: true; origin?: OriginLike }): boolean {
+export function isNewWork(e: { command?: unknown; isMeta?: true; origin?: OriginLike; turnId?: string }): boolean {
   if (e.command !== undefined) return false
   if (e.isMeta) return false
+  // Delivered into a turn that is already running: part of that work.
+  if (e.turnId !== undefined) return false
   if (e.origin && PASS_ORIGINS.has(e.origin.kind)) return false
   return true
 }
@@ -717,7 +731,7 @@ export function bandText(d: BandData, columns = 120): string {
 export function refusalText(s: Status, now: number, timeZone: string, kind: 'prompt' | 'agent'): string {
   const what = kind === 'prompt' ? 'Prompt not sent' : 'New agent not started'
   if (s.level === 'failing') {
-    return `bringback5hourlimit: ${what}: usage can't be read (${s.reason}) and fail mode is "closed". /5h set fail open, or /5h off.`
+    return `bringback5hourlimit: ${what}: usage can't be read (${s.reason}) and fail mode is "closed". /5h set fail open, or /5h off. If those fail too, set "Fail mode" to open in /config or BB5H_FAIL_MODE=open.`
   }
   return (
     `bringback5hourlimit: ${what}: your ${s.windowLabel} limit is reached (${usedText(s)}). ` +

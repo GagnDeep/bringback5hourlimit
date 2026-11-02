@@ -171,6 +171,22 @@ describe('strategies', () => {
     expect(L.mergeLimits(hi, up)).toBe(up)
   })
 
+  test('mergeLimits: a copy of an already-ended window never beats a live one', async () => {
+    const live: L.Limits = { at: T0, fiveHour: { pct: 20, resetsAt: T0 + 4 * HOUR } }
+    const ended: L.Limits = { at: T0 + 60_000, fiveHour: { pct: 95, resetsAt: T0 - HOUR } }
+    expect(L.mergeLimits(live, ended)?.fiveHour?.pct).toBe(20)
+    expect(L.mergeLimits(ended, live)?.fiveHour?.pct).toBe(20)
+  })
+
+  test('isNewWindow: needs usage to fall; a moved reset time alone is a schedule change', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    expect(L.isNewWindow({ pct: 57, resetsAt: R }, { pct: 58, resetsAt: R + 3 * 24 * HOUR })).toBe(false)
+    expect(L.isNewWindow({ pct: 57, resetsAt: R }, { pct: 57, resetsAt: R + 3 * 24 * HOUR })).toBe(false)
+    expect(L.isNewWindow({ pct: 57, resetsAt: R }, { pct: 1, resetsAt: R + 7 * 24 * HOUR })).toBe(true)
+    expect(L.isNewWindow({ pct: 57 }, { pct: 56 })).toBe(false)
+    expect(L.isNewWindow({ pct: 57 }, { pct: 2 })).toBe(true)
+  })
+
   test('weekly delta: no baseline at start takes the first reading', async () => {
     let b = L.startBlock(T0, cfg())
     b = L.observeWeekly(b, 50).block
@@ -260,6 +276,9 @@ describe('prompts that are never refused', () => {
     expect(L.isNewWork({ origin: { kind: 'task-notification' } })).toBe(false)
     expect(L.isNewWork({ origin: { kind: 'unclassified' } })).toBe(false)
     expect(L.isNewWork({ origin: { kind: 'composer' }, isMeta: true })).toBe(false)
+    expect(L.isNewWork({ origin: { kind: 'composer' }, turnId: 't-1' })).toBe(false)
+    expect(L.isNewWork({ origin: { kind: 'peer-send-message' } })).toBe(false)
+    expect(L.isNewWork({ origin: { kind: 'scheduled-trigger' } })).toBe(true)
   })
 })
 

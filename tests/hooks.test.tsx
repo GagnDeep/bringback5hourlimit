@@ -65,6 +65,42 @@ describe('verified Ultra (weekly window only)', () => {
     expect((w.store.get('block') as { weeklyCarried: number }).weeklyCarried).toBe(0)
   })
 
+  test('at the cap, in-flight work still passes: resumed agents, deliveries into a running turn, SendMessage replies', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    w.setLimits(ULTRA(60))
+    await $.session.measure(measureInput(ULTRA(60)))
+    expect((await $.agent.spawn(spawnInput())).deny).toMatch(/New agent not started/)
+    const resumed = { ...(spawnInput() as object), resume: { agentId: 'a-1' } } as never
+    expect((await $.agent.spawn(resumed)).deny).toBe(undefined)
+    expect((await $.prompt.submit(prompt('x', { turnId: 't-1' }))).drop).toBe(undefined)
+    expect((await $.prompt.submit(prompt('x', { origin: { kind: 'peer-send-message' } }))).drop).toBe(undefined)
+    expect((await $.prompt.submit(prompt('x'))).drop).toMatch(/limit is reached/)
+  })
+
+  test('one desktop notification per block across sessions', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(40) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    w.store.set('notified', T0) // another session already notified for this block
+    w.setLimits(ULTRA(60))
+    await $.session.measure(measureInput(ULTRA(60)))
+    expect(w.notifications.length).toBe(0)
+    expect(w.toasts.some(t => /budget spent/.test(t))).toBe(true)
+  })
+
+  test('a reset time that moves while usage grows is not a weekly reset', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(57) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    const moved = [{ kind: 'seven_day', percentUsed: 58, resetsAt: iso(T0 + 7 * 24 * HOUR + 2 * HOUR) }]
+    w.setLimits(moved)
+    await $.session.measure(measureInput(moved))
+    expect((w.store.get('block') as { weeklyCarried: number }).weeklyCarried).toBe(0)
+    expect((await $.prompt.submit(prompt('next'))).drop).toBe(undefined)
+  })
+
   test('background notifications and slash commands still pass at the cap', async ($, on) => {
     const w = world(on, { rateLimits: ULTRA(40) })
     await $.session.start(START)
@@ -343,6 +379,25 @@ describe('/5h commands', () => {
   })
 })
 
+describe('several sessions on a 5-hour plan', () => {
+  test("an idle session's copy of an ended 5-hour window doesn't knock out the live one", async ($, on) => {
+    const w = world(on, { rateLimits: MAX(20) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    await $.session.measure(measureInput(MAX(20)))
+    // This process now plays the idle one: its cached figures are last window's.
+    w.setLimits([
+      { kind: 'five_hour', percentUsed: 95, resetsAt: iso(T0 - HOUR) },
+      { kind: 'seven_day', percentUsed: 30, resetsAt: iso(T0 + 3 * 24 * HOUR) },
+    ])
+    await w.clock.advance(30_000)
+    const status = (await $.command.run(cmd('status'))).text ?? ''
+    expect((w.store.get('limits') as { fiveHour?: { pct: number } }).fiveHour?.pct).toBe(20)
+    expect(status).not.toMatch(/share of your week|weekly %/i)
+    expect((await $.prompt.submit(prompt('next'))).drop).toBe(undefined)
+  })
+})
+
 describe('fail-open and fail-closed when the usage source errors', () => {
   test('auto mode degrades to tokens and says so; nothing is refused', async ($, on) => {
     const w = world(on, { usageThrows: true })
@@ -379,7 +434,9 @@ describe('fail-open and fail-closed when the usage source errors', () => {
     const w = world(on, { rateLimits: ULTRA(40), env: { BB5H_FAIL_MODE: 'closed' } })
     await $.session.start(START)
     w.breakStore()
-    expect((await $.prompt.submit(prompt('a'))).drop).toMatch(/usage check failed/)
+    expect((await $.prompt.submit(prompt('a'))).drop).toMatch(/usage check failed.*\/config or BB5H_FAIL_MODE=open/)
+    // /5h itself can't write either: it says so instead of crashing.
+    expect(((await $.command.run(cmd('off'))).text ?? '')).toMatch(/\/5h failed .*\/config or BB5H_FAIL_MODE=open/)
   })
 })
 
