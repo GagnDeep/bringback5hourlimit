@@ -40,6 +40,9 @@ Invalid values fall back to the next layer down and are reported in `/5h status`
    - At block start the mod records `weeklyBase` = the latest weekly %.
    - spent = `weeklyCarried + (weeklyLast − weeklyBase)`.
    - If weekly % drops (the weekly window reset mid-block), the spend so far is carried and the baseline is reset to 0.
+   - A drop only counts as a reset when the window's reset time moved on by over an hour and the new window began after the block did. Any other dip is a stale copy (another Claude Code process still holding an older cached reading) and is ignored.
+   - Saved readings never go down inside one window: a lower % for the same reset time loses to the higher one, whichever was written last.
+   - `healBlock` repairs any block that carries spend from a reset that can't have happened (written by an older version or a process still running one), and caps carried spend at 100.
    - If no weekly reading exists at block start, the baseline is taken at the first reading inside the block.
    - Budget = `weeklyBudgetPct`. The default of 15 is roughly 6–7 full blocks a week. It is **not** Anthropic's old ratio.
 3. **tokens**: no fresh usage data (offline, API changed, API-key use, or forced).

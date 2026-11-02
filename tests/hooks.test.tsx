@@ -40,6 +40,31 @@ describe('verified Ultra (weekly window only)', () => {
     expect(w.notifications.length).toBe(1)
   })
 
+  test('two sessions disagreeing on the weekly % (one cached a point behind) never trip the cap', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(57) })
+    await $.session.start(START)
+    expect((await $.prompt.submit(prompt('one prompt'))).drop).toBe(undefined)
+    for (let i = 0; i < 6; i++) {
+      // Another process, a point behind, writes its cached reading as newer...
+      w.store.set('limits', { at: T0 + (i + 1) * 1000, sevenDay: { pct: 56, resetsAt: T0 + 3 * 24 * HOUR } })
+      await w.clock.advance(2000)
+      // ...and this one hears the current figure again.
+      await $.session.measure(measureInput(ULTRA(57)))
+    }
+    expect((w.store.get('block') as { weeklyCarried: number }).weeklyCarried).toBe(0)
+    expect((await $.prompt.submit(prompt('next'))).drop).toBe(undefined)
+    expect(((await $.command.run(cmd('status'))).text ?? '')).toMatch(/0% used|≈/)
+  })
+
+  test('a block corrupted by an older version (228% carried) is repaired on the next prompt', async ($, on) => {
+    const w = world(on, { rateLimits: ULTRA(57) })
+    await $.session.start(START)
+    await $.prompt.submit(prompt('start'))
+    w.store.set('block', { startedAt: T0, endsAt: T0 + 5 * HOUR, weeklyCarried: 228, weeklyBase: 0, weeklyLast: 57 })
+    expect((await $.prompt.submit(prompt('after'))).drop).toBe(undefined)
+    expect((w.store.get('block') as { weeklyCarried: number }).weeklyCarried).toBe(0)
+  })
+
   test('background notifications and slash commands still pass at the cap', async ($, on) => {
     const w = world(on, { rateLimits: ULTRA(40) })
     await $.session.start(START)

@@ -82,3 +82,7 @@ Researched 2026-11-01 against **Claude Code 2.1.316** (`claude --version`; ≥ 2
 4. **Old 5h/weekly ratio.** Anthropic never published the old ratio between the 5-hour and weekly limits. The default emulated budget (15 % of weekly per block) is a judgement call, not Anthropic's number.
 5. **`agent.spawn` on resumes.** The Docs reference page says the hook isn't raised on a SendMessage resume; changelog 2.1.299 says it is (`e.resume`). D (2.1.316) documents `resume`, so the mod treats resumes like new agents.
 6. **Verified Ultra in practice: resolved.** In the live smoke test on this machine, `$.session.usage().rateLimits` held **only `seven_day`** (56 %, with `resetsAt`) and no `five_hour` entry, and `auto` selected the weekly-Δ strategy. This confirms the "left out, never zeroed" representation on a real account without a 5-hour window.
+
+## Several processes see different weekly %s
+Each Claude Code process caches the rate limits from its own last API response, so `$.session.usage()` in an idle session can report a figure a point or more behind a busy one. Seen live on 2026-11-02: an idle session kept 56% while the active one had 57%. Taking the newest write as truth let the two flip the shared reading 57 → 56 → 57; v1.2.1 and earlier read each dip as a weekly reset and carried 57 points per flip (228% after four). Readings for one window are now only allowed to rise, resets need the reset time to move, and corrupted blocks are repaired.
+

@@ -42,6 +42,7 @@ export const DEFAULTS: Config = {
 export const DEFAULT_TOKENS_PER_WEEKLY_PCT = 4_000_000
 
 const HOUR = 3_600_000
+const WEEK = 7 * 24 * HOUR
 
 // ---------------------------------------------------------------- config
 
@@ -151,7 +152,34 @@ export function parseRateLimits(list: readonly RateLimitLike[] | undefined, now:
 export function mergeLimits(a: Limits | undefined, b: Limits | undefined): Limits | undefined {
   if (!a) return b
   if (!b) return a
-  return b.at >= a.at ? b : a
+  const [older, newer] = b.at >= a.at ? [a, b] : [b, a]
+  // Inside one window usage only grows. A lower figure for the same window is
+  // a stale copy (another process's cached reading), so the higher one stands.
+  const keep = (o: Window | undefined, n: Window | undefined): Window | undefined =>
+    o && n && sameWindow(o, n) && o.pct > n.pct ? o : n
+  const fiveHour = keep(older.fiveHour, newer.fiveHour)
+  const sevenDay = keep(older.sevenDay, newer.sevenDay)
+  if (fiveHour === newer.fiveHour && sevenDay === newer.sevenDay) return newer
+  const out: Limits = { at: newer.at }
+  if (fiveHour) out.fiveHour = fiveHour
+  if (sevenDay) out.sevenDay = sevenDay
+  return out
+}
+
+/** Two readings of one window: the same reset time (a minute's slack), or neither says. */
+export function sameWindow(a: Window, b: Window): boolean {
+  if (a.resetsAt === undefined || b.resetsAt === undefined) return a.resetsAt === b.resetsAt
+  return Math.abs(a.resetsAt - b.resetsAt) <= 60_000
+}
+
+/**
+ * True when `next` belongs to a later window than `prev`: its reset time moved
+ * on by over an hour. Without both reset times, only a fall to under half (by
+ * 5+ points) reads as a new window; smaller dips are stale copies.
+ */
+export function isNewWindow(prev: Window, next: Window): boolean {
+  if (prev.resetsAt !== undefined && next.resetsAt !== undefined) return next.resetsAt > prev.resetsAt + HOUR
+  return next.pct < prev.pct / 2 && prev.pct - next.pct >= 5
 }
 
 export function isFresh(limits: Limits | undefined, now: number, cfg: Config): limits is Limits {
@@ -220,6 +248,8 @@ export type Block = {
    * inside a weekly point, so the first rise after it is no clean sample.
    */
   stepExact?: boolean
+  /** The weekly window's reset time when `weeklyLast` was read. */
+  weeklyResetsAt?: number
 }
 
 export function isActive(block: Block | undefined, now: number): block is Block {
@@ -263,6 +293,8 @@ export function mergeBlock(a: Block | undefined, b: Block | undefined, now: numb
   const later = (A.stepTokens ?? -1) >= (B.stepTokens ?? -1) ? A : B
   if (later.stepTokens !== undefined) out.stepTokens = later.stepTokens
   if (later.stepExact) out.stepExact = true
+  const resets = [A.weeklyResetsAt, B.weeklyResetsAt].filter((x): x is number => x !== undefined)
+  if (resets.length) out.weeklyResetsAt = Math.max(...resets)
   if (base.length) out.weeklyBase = Math.min(...base)
   if (last.length) out.weeklyLast = A.weeklyCarried === B.weeklyCarried ? Math.max(...last) : (A.weeklyCarried > B.weeklyCarried ? A : B).weeklyLast
   return out
@@ -276,30 +308,64 @@ export type CalibrationSample = { tokens: number; pct: number }
  * `tokensNow` is the block's token total, so a rise yields a sample of how
  * many tokens one weekly point took.
  */
-export function observeWeekly(block: Block, pct: number, tokensNow = 0): { block: Block; sample?: CalibrationSample } {
+export function observeWeekly(block: Block, pct: number, tokensNow = 0, resetsAt?: number): { block: Block; sample?: CalibrationSample } {
+  if (!Number.isFinite(pct)) return { block }
+  const at = resetsAt !== undefined && Number.isFinite(resetsAt) ? { weeklyResetsAt: resetsAt } : {}
   if (block.weeklyBase === undefined || block.weeklyLast === undefined) {
-    return { block: { ...block, weeklyBase: pct, weeklyLast: pct, stepTokens: tokensNow, stepExact: false } }
+    return { block: { ...block, weeklyBase: pct, weeklyLast: pct, stepTokens: tokensNow, stepExact: false, ...at } }
   }
-  if (pct < block.weeklyLast - 0.5) {
+  const prev: Window = { pct: block.weeklyLast, ...(block.weeklyResetsAt !== undefined ? { resetsAt: block.weeklyResetsAt } : {}) }
+  const next: Window = { pct, ...(at.weeklyResetsAt !== undefined ? { resetsAt: at.weeklyResetsAt } : {}) }
+  if (isNewWindow(prev, next) && couldResetInside(block, at.weeklyResetsAt)) {
     // The weekly window reset inside this block: carry what was spent.
     return {
       block: {
         ...block,
-        weeklyCarried: block.weeklyCarried + Math.max(0, block.weeklyLast - block.weeklyBase),
+        weeklyCarried: round1(block.weeklyCarried + Math.max(0, block.weeklyLast - block.weeklyBase)),
         weeklyBase: 0,
         weeklyLast: pct,
         stepTokens: tokensNow,
         stepExact: false,
+        ...at,
       },
     }
   }
   if (pct > block.weeklyLast) {
     const rise = pct - block.weeklyLast
     const tokens = tokensNow - (block.stepTokens ?? 0)
-    const next = { ...block, weeklyLast: pct, stepTokens: tokensNow, stepExact: true }
-    return block.stepExact && tokens > 0 ? { block: next, sample: { tokens, pct: rise } } : { block: next }
+    const moved = { ...block, weeklyLast: pct, stepTokens: tokensNow, stepExact: true, ...at }
+    return block.stepExact && tokens > 0 ? { block: moved, sample: { tokens, pct: rise } } : { block: moved }
   }
-  return { block }
+  // The same or lower inside the same window: a stale copy, nothing to learn.
+  return { block: block.weeklyResetsAt === undefined && at.weeklyResetsAt !== undefined ? { ...block, ...at } : block }
+}
+
+/**
+ * A weekly window can only have reset inside the block if the current window
+ * began after the block did. Windows are a week long, so with a reset time in
+ * hand that is checkable; without one, the drop rule alone decides.
+ */
+function couldResetInside(block: Block, resetsAt: number | undefined): boolean {
+  return resetsAt === undefined || resetsAt - WEEK > block.startedAt - HOUR
+}
+
+/**
+ * Repairs a block that carries spend from a weekly reset that cannot have
+ * happened (the live window began before the block). Older versions, and any
+ * process still running one, read a stale lower % as a reset; this undoes it
+ * wherever it shows up, including after merging with such a process's write.
+ * Carried spend is also capped at 100 (a whole week).
+ */
+export function healBlock(block: Block, limits: Limits | undefined): Block {
+  let out = block
+  const resetsAt = limits?.sevenDay?.resetsAt
+  if (out.weeklyCarried > 0 && resetsAt !== undefined && !couldResetInside(out, resetsAt)) {
+    const last = Math.max(out.weeklyLast ?? 0, limits?.sevenDay?.pct ?? 0)
+    out = { ...out, weeklyCarried: 0, weeklyBase: out.weeklyBase && out.weeklyBase > 0 ? Math.min(out.weeklyBase, last) : last, weeklyLast: last, stepExact: false }
+  }
+  if (out.weeklyCarried > 100) out = { ...out, weeklyCarried: 100 }
+  if (!Number.isFinite(out.weeklyCarried) || out.weeklyCarried < 0) out = { ...out, weeklyCarried: 0 }
+  return out
 }
 
 export type Calibration = { tokensPerPct: number; samples: number }

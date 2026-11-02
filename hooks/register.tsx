@@ -87,9 +87,9 @@ async function ensureSessionId($: $T, ctx: Ctx): Promise<string> {
 }
 
 /** Re-reads the shared block, merges ours in, writes when it changed. */
-async function writeBlock($: $T, mine: L.Block, now: number): Promise<L.Block> {
+async function writeBlock($: $T, mine: L.Block, now: number, limits: L.Limits | undefined): Promise<L.Block> {
   const stored = await getJSON<L.Block>($, KEY_BLOCK)
-  const merged = L.mergeBlock(stored, mine, now) ?? mine
+  const merged = L.healBlock(L.mergeBlock(stored, mine, now) ?? mine, limits)
   if (JSON.stringify(merged) !== JSON.stringify(stored)) await $.store.set(KEY_BLOCK, merged)
   return merged
 }
@@ -109,8 +109,11 @@ async function readTokens($: $T, blockStart: number): Promise<number> {
 async function saveLimits($: $T, fresh: L.Limits | undefined, isPushed: boolean): Promise<void> {
   if (!fresh) return
   const stored = await getJSON<L.Limits>($, KEY_LIMITS)
-  if (!isPushed && L.sameLimits(stored, fresh)) return
-  if (L.mergeLimits(stored, fresh) === fresh) await $.store.set(KEY_LIMITS, fresh)
+  const merged = L.mergeLimits(stored, fresh)
+  if (!merged || merged === stored) return
+  // A poll that changes nothing is not news: it keeps the stored reading's age.
+  if (!isPushed && L.sameLimits(stored, merged)) return
+  await $.store.set(KEY_LIMITS, merged)
 }
 
 async function readLimits($: $T, now: number): Promise<L.Limits | undefined> {
@@ -139,7 +142,7 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
   if (!isIdle) {
     const fresh = L.liveLimits(limits, now, cfg)
     if (fresh?.sevenDay && fresh.at >= block.startedAt - L.BASELINE_MAX_AGE_MS) {
-      const seen = L.observeWeekly(block, fresh.sevenDay.pct, tokens)
+      const seen = L.observeWeekly(block, fresh.sevenDay.pct, tokens, fresh.sevenDay.resetsAt)
       block = seen.block
       if (seen.sample) {
         const learned = L.calibrate(calibration, seen.sample)
@@ -149,7 +152,7 @@ async function snapshot($: $T, ctx: Ctx, start: boolean): Promise<Snapshot> {
         }
       }
     }
-    block = await writeBlock($, block, now)
+    block = await writeBlock($, L.healBlock(block, limits), now, limits)
   }
   const status = L.evaluate({ cfg, now, block, limits, tokens, control, ...(calibration ? { calibration } : {}) })
   ctx.lastStatus = status

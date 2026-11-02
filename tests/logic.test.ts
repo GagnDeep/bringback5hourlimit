@@ -115,6 +115,62 @@ describe('strategies', () => {
     expect(L.weeklySpent(b)).toBe(11)
   })
 
+  test('weekly delta: a stale lower % in the same window is not a reset (two processes disagreeing)', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    let b = L.startBlock(T0, cfg(), 57)
+    for (let i = 0; i < 6; i++) {
+      b = L.observeWeekly(b, 56, 0, R).block // one process's cached copy
+      b = L.observeWeekly(b, 57, 0, R).block // the other's current reading
+    }
+    expect(b.weeklyCarried).toBe(0)
+    expect(L.weeklySpent(b)).toBe(0)
+    b = L.observeWeekly(b, 58, 0, R).block
+    expect(L.weeklySpent(b)).toBe(1)
+  })
+
+  test('weekly delta: a reset needs the reset time to move on and the new window to start inside the block', async () => {
+    const R = T0 + 2 * HOUR // this week resets two hours into the block
+    let b = L.startBlock(T0, cfg(), 70)
+    b = L.observeWeekly(b, 74, 0, R).block
+    b = L.observeWeekly(b, 1, 0, R + 7 * 24 * HOUR).block
+    expect(b.weeklyCarried).toBe(4)
+    expect(L.weeklySpent(b)).toBe(5) // 4 before the reset + 1 into the new week
+    b = L.observeWeekly(b, 3, 0, R + 7 * 24 * HOUR).block
+    expect(L.weeklySpent(b)).toBe(7)
+    // A later reset time on a window that began before the block: not a reset.
+    let c = L.startBlock(T0, cfg(), 50)
+    c = L.observeWeekly(c, 20, 0, T0 + 6 * 24 * HOUR).block
+    expect(c.weeklyCarried).toBe(0)
+  })
+
+  test('healBlock repairs carried spend from a reset that cannot have happened', async () => {
+    const limits = ultra(57, T0 + 2 * 60_000)
+    const bad: L.Block = { startedAt: T0, endsAt: T0 + 5 * HOUR, weeklyCarried: 228, weeklyBase: 0, weeklyLast: 57 }
+    const healed = L.healBlock(bad, limits)
+    expect(healed.weeklyCarried).toBe(0)
+    expect(L.weeklySpent(healed)).toBe(0)
+    expect(L.evaluate({ cfg: cfg(), now: T0 + 3 * 60_000, block: healed, limits, tokens: 0, control: {} }).level).toBe('ok')
+    // A genuine reset (the window began inside the block) is left alone, capped at a week.
+    const real: L.Block = { startedAt: T0, endsAt: T0 + 5 * HOUR, weeklyCarried: 6, weeklyBase: 0, weeklyLast: 2 }
+    expect(L.healBlock(real, { at: T0 + HOUR, sevenDay: { pct: 2, resetsAt: T0 + 7 * 24 * HOUR } }).weeklyCarried).toBe(6)
+    expect(L.healBlock({ ...real, weeklyCarried: 500 }, undefined).weeklyCarried).toBe(100)
+    expect(L.healBlock({ ...real, weeklyCarried: Number.NaN }, undefined).weeklyCarried).toBe(0)
+  })
+
+  test('mergeLimits: within a window the higher % stands; a new window replaces it', async () => {
+    const R = T0 + 3 * 24 * HOUR
+    const hi: L.Limits = { at: T0, sevenDay: { pct: 57, resetsAt: R } }
+    const staleLater: L.Limits = { at: T0 + 60_000, sevenDay: { pct: 56, resetsAt: R } }
+    const merged = L.mergeLimits(hi, staleLater)
+    expect(merged?.sevenDay?.pct).toBe(57)
+    expect(merged?.at).toBe(T0 + 60_000)
+    expect(L.mergeLimits(staleLater, hi)?.sevenDay?.pct).toBe(57)
+    const next: L.Limits = { at: T0 + 2 * 60_000, sevenDay: { pct: 1, resetsAt: R + 7 * 24 * HOUR } }
+    expect(L.mergeLimits(hi, next)).toBe(next)
+    const up: L.Limits = { at: T0 + 60_000, sevenDay: { pct: 58, resetsAt: R } }
+    expect(L.mergeLimits(hi, up)).toBe(up)
+  })
+
   test('weekly delta: no baseline at start takes the first reading', async () => {
     let b = L.startBlock(T0, cfg())
     b = L.observeWeekly(b, 50).block
